@@ -1,8 +1,9 @@
 RDFLib-SQLAlchemy
 =================
 
-A SQLAlchemy-backed, formula-aware RDFLib Store. It stores its triples
-in the following partitions:
+A SQLAlchemy-backed, formula-aware RDFLib Store. This is the hacked non-autocommitting version (for performance gain).
+
+It stores its triples in the following partitions:
 
 - Asserted non rdf:type statements.
 - Asserted rdf:type statements (in a table which models Class membership). The motivation for this partition is primarily query speed and scalability as most graphs will always have more rdf:type statements than others.
@@ -13,7 +14,7 @@ In addition, it persists namespace mappings in a separate table.
 Back-end persistence
 --------------------
 
-Back-end persistence is provided by SQLAlchemy.
+Back-end persistence is provided by SQLAlchemy. 
 
 Tested dialects are:
 
