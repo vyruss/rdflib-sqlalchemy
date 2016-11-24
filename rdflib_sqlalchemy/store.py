@@ -310,7 +310,9 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             trans = connection.begin()
             try:
                 for command in commands_dict.values():
-                    connection.execute(command["statement"], command["params"])
+                    ### "Big Data" hack:
+                    ### Causes large INSERT statements to be created instead of too many INSERTS
+                    connection.execute(command["statement"].values(command["params"]))
                 trans.commit()
             except Exception:
                 _logger.exception("AddN failed.")
@@ -455,22 +457,30 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
         q = union_select(selects, select_type=TRIPLE_SELECT_NO_ORDER)
         with self.engine.connect() as connection:
-            res = connection.execute(q)
+            ### This causes the database to stream the results to Python via a serverside cursor
+            res = (connection.execution_options(stream_results=True).execute(q))
+
             # TODO: False but it may have limitations on text column. Check
             # NOTE: SQLite does not support ORDER BY terms that aren't
             # integers, so the entire result set must be iterated in order
             # to be able to return a generator of contexts
-            result = res.fetchall()
-        tripleCoverage = {}
 
-        for rt in result:
-            id, s, p, o, (graphKlass, idKlass, graphId) = extract_triple(rt, self, context)
-            contexts = tripleCoverage.get((s, p, o), [])
-            contexts.append(graphKlass(self, idKlass(graphId)))
-            tripleCoverage[(s, p, o)] = contexts
+            while True:
+                result = res.fetchmany(1000)
+                if not result:
+                    break
+                tripleCoverage = {}
 
-        for (s, p, o), contexts in tripleCoverage.items():
-            yield (s, p, o), (c for c in contexts)
+                for rt in result:
+                    id, s, p, o, (graphKlass, idKlass, graphId) = extract_triple(rt, self, context)
+                    contexts = tripleCoverage.get((s, p, o), [])
+                    contexts.append(graphKlass(self, idKlass(graphId)))
+                    tripleCoverage[(s, p, o)] = contexts
+
+                for (s, p, o), contexts in tripleCoverage.items():
+                    yield (s, p, o), (c for c in contexts)
+
+                del result
 
     def triples_choices(self, triple, context=None):
         """
