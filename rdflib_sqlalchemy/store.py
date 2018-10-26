@@ -1,532 +1,61 @@
 """SQLAlchemy-based RDF store."""
-
-from __future__ import with_statement
-
 import hashlib
 import logging
-import re
-import sys
 
 import sqlalchemy
 from rdflib import (
     BNode,
     Literal,
-    RDF,
     URIRef
 )
-from rdflib.graph import Graph
-from rdflib.graph import QuotedGraph
-from rdflib.plugins.stores.regexmatching import PYTHON_REGEX
-from rdflib.plugins.stores.regexmatching import REGEXTerm
-from rdflib.store import Store
-from rdflib.term import Node
+from rdflib.term import Statement, Variable
+from rdflib.graph import Graph, QuotedGraph
+from rdflib.namespace import RDF
+from rdflib.plugins.stores.regexmatching import PYTHON_REGEX, REGEXTerm
+from rdflib.store import CORRUPTED_STORE, VALID_STORE, NodePickler, Store
 from six import text_type
 from six.moves import reduce
-from six.moves.urllib.parse import unquote_plus
-from sqlalchemy import Column, Table, MetaData, Index, types
-from sqlalchemy.sql import select, expression
+from sqlalchemy import MetaData
+from sqlalchemy.engine import reflection
+from sqlalchemy.sql import expression, select
 
-from .termutils import REVERSE_TERM_COMBINATIONS
-from .termutils import TERM_INSTANTIATION_DICT
-from .termutils import constructGraph
-from .termutils import type2TermCombination
-from .termutils import statement2TermCombination
-from . import __version__
+from rdflib_sqlalchemy.constants import (
+    ASSERTED_LITERAL_PARTITION,
+    ASSERTED_NON_TYPE_PARTITION,
+    ASSERTED_TYPE_PARTITION,
+    CONTEXT_SELECT,
+    COUNT_SELECT,
+    INTERNED_PREFIX,
+    QUOTED_PARTITION,
+    TRIPLE_SELECT_NO_ORDER,
+)
+from rdflib_sqlalchemy.tables import (
+    create_asserted_statements_table,
+    create_literal_statements_table,
+    create_namespace_binds_table,
+    create_quoted_statements_table,
+    create_type_statements_table,
+    get_table_names,
+)
+from rdflib_sqlalchemy.base import SQLGeneratorMixin
+from rdflib_sqlalchemy.sql import union_select
+from rdflib_sqlalchemy.statistics import StatisticsMixin
+from rdflib_sqlalchemy.termutils import extract_triple
 
 
 _logger = logging.getLogger(__name__)
 
-COUNT_SELECT = 0
-CONTEXT_SELECT = 1
-TRIPLE_SELECT = 2
-TRIPLE_SELECT_NO_ORDER = 3
-
-ASSERTED_NON_TYPE_PARTITION = 3
-ASSERTED_TYPE_PARTITION = 4
-QUOTED_PARTITION = 5
-ASSERTED_LITERAL_PARTITION = 6
-
-FULL_TRIPLE_PARTITIONS = [QUOTED_PARTITION, ASSERTED_LITERAL_PARTITION]
-
-INTERNED_PREFIX = "kb_"
-
-MYSQL_MAX_INDEX_LENGTH = 200
-
 Any = None
 
-# Stolen from Will Waites' py4s
+
+def generate_interned_id(identifier):
+    return "{prefix}{identifier_hash}".format(
+        prefix=INTERNED_PREFIX,
+        identifier_hash=hashlib.sha1(identifier.encode("utf8")).hexdigest()[:10],
+    )
 
 
-def skolemise(statement):
-    """Skolemise."""
-    def _sk(x):
-        if isinstance(x, BNode):
-            return URIRef("bnode:%s" % x)
-        return x
-    return tuple(map(_sk, statement))
-
-
-def deskolemise(statement):
-    """Deskolemise."""
-    def _dst(x):
-        if isinstance(x, URIRef) and x.startswith("bnode:"):
-            _unused, bnid = x.split(":", 1)
-            return BNode(bnid)
-        return x
-    return tuple(map(_dst, statement))
-
-
-def regexp(expr, item):
-    """User-defined REGEXP operator."""
-    r = re.compile(expr)
-    return r.match(item) is not None
-
-
-def _parse_rfc1738_args(name):
-    import cgi
-    """ parse url str into options
-    code orig from sqlalchemy.engine.url """
-    pattern = re.compile(r"""
-            (?P<name>[\w\+]+)://
-            (?:
-                (?P<username>[^:/]*)
-                (?::(?P<password>[^/]*))?
-            @)?
-            (?:
-                (?P<host>[^/:]*)
-                (?::(?P<port>[^/]*))?
-            )?
-            (?:/(?P<database>.*))?
-            """, re.X)
-
-    m = pattern.match(name)
-    if m is not None:
-        (name, username, password, host, port, database) = m.group(
-            1, 2, 3, 4, 5, 6)
-        if database is not None:
-            tokens = database.split(r"?", 2)
-            database = tokens[0]
-            query = (
-                len(tokens) > 1 and dict(cgi.parse_qsl(tokens[1])) or None)
-            if query is not None:
-                query = dict([(k.encode("ascii"), query[k]) for k in query])
-        else:
-            query = None
-        opts = {"username": username, "password": password, "host":
-                host, "port": port, "database": database, "query": query}
-        if opts["password"] is not None:
-            opts["password"] = unquote_plus(opts["password"])
-        return (name, opts)
-    else:
-        raise ValueError("Could not parse rfc1738 URL from string '%s'" % name)
-
-
-def queryAnalysis(query, store, connection):
-    """
-    Helper function.
-
-    For executing EXPLAIN on all dispatched SQL statements -
-    for the pupose of analyzing index usage
-    """
-    res = connection.execute("explain " + query)
-    rt = res.fetchall()[0]
-    table, joinType, posKeys, _key, key_len, \
-        comparedCol, rowsExamined, extra = rt
-    if not _key:
-        assert joinType == "ALL"
-        if not hasattr(store, "queryOptMarks"):
-            store.queryOptMarks = {}
-        hits = store.queryOptMarks.get(("FULL SCAN", table), 0)
-        store.queryOptMarks[("FULL SCAN", table)] = hits + 1
-
-    if not hasattr(store, "queryOptMarks"):
-        store.queryOptMarks = {}
-    hits = store.queryOptMarks.get((_key, table), 0)
-    store.queryOptMarks[(_key, table)] = hits + 1
-
-
-def unionSELECT(selectComponents, distinct=False, selectType=TRIPLE_SELECT):
-    """
-    Helper function for building union all select statement.
-
-    Terms: u - uri refs  v - variables  b - bnodes l - literal f - formula
-
-    Takes a list of:
-     - table name
-     - table alias
-     - table type (literal, type, asserted, quoted)
-     - where clause string
-    """
-    selects = []
-    for table, whereClause, tableType in selectComponents:
-
-        if selectType == COUNT_SELECT:
-            selectClause = table.count(whereClause)
-        elif selectType == CONTEXT_SELECT:
-            selectClause = expression.select([table.c.context], whereClause)
-        elif tableType in FULL_TRIPLE_PARTITIONS:
-            selectClause = table.select(whereClause)
-        elif tableType == ASSERTED_TYPE_PARTITION:
-            selectClause = expression.select(
-                [table.c.id.label("id"),
-                 table.c.member.label("subject"),
-                 expression.literal(text_type(RDF.type)).label("predicate"),
-                 table.c.klass.label("object"),
-                 table.c.context.label("context"),
-                 table.c.termComb.label("termcomb"),
-                 expression.literal_column("NULL").label("objlanguage"),
-                 expression.literal_column("NULL").label("objdatatype")][1 if __version__ <= "0.2" else 0:],
-                whereClause)
-        elif tableType == ASSERTED_NON_TYPE_PARTITION:
-            selectClause = expression.select(
-                [c for c in table.columns] +
-                [expression.literal_column("NULL").label("objlanguage"),
-                 expression.literal_column("NULL").label("objdatatype")],
-                whereClause,
-                from_obj=[table])
-
-        selects.append(selectClause)
-
-    orderStmt = []
-    if selectType == TRIPLE_SELECT:
-        orderStmt = [expression.literal_column("subject"),
-                     expression.literal_column("predicate"),
-                     expression.literal_column("object")]
-    if distinct:
-        return expression.union(*selects, **{"order_by": orderStmt})
-    else:
-        return expression.union_all(*selects, **{"order_by": orderStmt})
-
-
-def extractTriple(tupleRt, store, hardCodedContext=None):
-    """
-    Extract a triple.
-
-    Take a tuple which represents an entry in a result set and
-    converts it to a tuple of terms using the termComb integer
-    to interpret how to instantiate each term
-    """
-    if __version__ <= "0.2":
-        try:
-            subject, predicate, obj, rtContext, termComb, \
-                objLanguage, objDatatype = tupleRt
-            termCombString = REVERSE_TERM_COMBINATIONS[termComb]
-            subjTerm, predTerm, objTerm, ctxTerm = termCombString
-        except ValueError:
-            subject, subjTerm, predicate, predTerm, obj, objTerm, \
-                rtContext, ctxTerm, objLanguage, objDatatype = tupleRt
-    else:
-        try:
-            id, subject, predicate, obj, rtContext, termComb, \
-                objLanguage, objDatatype = tupleRt
-            termCombString = REVERSE_TERM_COMBINATIONS[termComb]
-            subjTerm, predTerm, objTerm, ctxTerm = termCombString
-        except ValueError:
-            id, subject, subjTerm, predicate, predTerm, obj, objTerm, \
-                rtContext, ctxTerm, objLanguage, objDatatype = tupleRt
-
-    context = rtContext is not None \
-        and rtContext \
-        or hardCodedContext.identifier
-    s = createTerm(subject, subjTerm, store)
-    p = createTerm(predicate, predTerm, store)
-    o = createTerm(obj, objTerm, store, objLanguage, objDatatype)
-
-    graphKlass, idKlass = constructGraph(ctxTerm)
-    if __version__ <= "0.2":
-        return s, p, o, (graphKlass, idKlass, context)
-    else:
-        return id, s, p, o, (graphKlass, idKlass, context)
-
-
-def createTerm(
-        termString, termType, store, objLanguage=None, objDatatype=None):
-    # TODO: Stuff
-    """
-    Take a term value, term type, and store instance and creates a term object.
-
-    QuotedGraphs are instantiated differently
-    """
-    if termType == "L":
-        cache = store.literalCache.get((termString, objLanguage, objDatatype))
-        if cache is not None:
-            # store.cacheHits += 1
-            return cache
-        else:
-            # store.cacheMisses += 1
-            # rt = Literal(termString, objLanguage, objDatatype)
-            # store.literalCache[((termString, objLanguage, objDatatype))] = rt
-            if objLanguage and not objDatatype:
-                rt = Literal(termString, objLanguage)
-                store.literalCache[((termString, objLanguage))] = rt
-            elif objDatatype and not objLanguage:
-                rt = Literal(termString, datatype=objDatatype)
-                store.literalCache[((termString, objDatatype))] = rt
-            elif not objLanguage and not objDatatype:
-                rt = Literal(termString)
-                store.literalCache[((termString))] = rt
-            else:
-                rt = Literal(termString, objDatatype)
-                store.literalCache[((termString, objDatatype))] = rt
-            return rt
-    elif termType == "F":
-        cache = store.otherCache.get((termType, termString))
-        if cache is not None:
-            # store.cacheHits += 1
-            return cache
-        else:
-            # store.cacheMisses += 1
-            rt = QuotedGraph(store, URIRef(termString))
-            store.otherCache[(termType, termString)] = rt
-            return rt
-    elif termType == "B":
-        cache = store.bnodeCache.get((termString))
-        if cache is not None:
-            # store.cacheHits += 1
-            return cache
-        else:
-            # store.cacheMisses += 1
-            rt = TERM_INSTANTIATION_DICT[termType](termString)
-            store.bnodeCache[(termString)] = rt
-            return rt
-    elif termType == "U":
-        cache = store.uriCache.get((termString))
-        if cache is not None:
-            # store.cacheHits += 1
-            return cache
-        else:
-            # store.cacheMisses += 1
-            rt = URIRef(termString)
-            store.uriCache[(termString)] = rt
-            return rt
-    else:
-        cache = store.otherCache.get((termType, termString))
-        if cache is not None:
-            # store.cacheHits += 1
-            return cache
-        else:
-            # store.cacheMisses += 1
-            rt = TERM_INSTANTIATION_DICT[termType](termString)
-            store.otherCache[(termType, termString)] = rt
-            return rt
-
-
-class TermType(types.TypeDecorator):
-    """Term typology."""
-
-    impl = types.Text
-
-    def process_bind_param(self, value, dialect):
-        """Process bound parameters."""
-        if isinstance(value, (QuotedGraph, Graph)):
-            return text_type(value.identifier)
-        elif isinstance(value, Node):
-            return text_type(value)
-        else:
-            return value
-
-
-class SQLGenerator(object):
-    """SQL statement generator."""
-
-    def buildTypeSQLCommand(self, member, klass, context):
-        """Build an insert command for a type table."""
-        # columns: member,klass,context
-        rt = self.tables["type_statements"].insert()
-        return rt, {
-            "member": member,
-            "klass": klass,
-            "context": context.identifier,
-            "termComb": int(type2TermCombination(member, klass, context))}
-
-    def buildLiteralTripleSQLCommand(
-            self, subject, predicate, obj, context):
-        """
-        Build an insert command for literal triples.
-
-        (Statements where the object is a Literal).
-        """
-        triplePattern = int(
-            statement2TermCombination(subject, predicate, obj, context))
-        command = self.tables["literal_statements"].insert()
-        values = {
-            "subject": subject,
-            "predicate": predicate,
-            "object": obj,
-            "context": context.identifier,
-            "termComb": triplePattern,
-            "objLanguage": isinstance(obj, Literal) and obj.language or None,
-            "objDatatype": isinstance(obj, Literal) and obj.datatype or None
-        }
-        return command, values
-
-    def buildTripleSQLCommand(
-            self, subject, predicate, obj, context, quoted):
-        """Build an insert command for regular triple table."""
-        stmt_table = quoted and self.tables["quoted_statements"] \
-            or self.tables["asserted_statements"]
-        triplePattern = statement2TermCombination(
-            subject, predicate, obj, context)
-        command = stmt_table.insert()
-        if quoted:
-            params = {
-                "subject": subject,
-                "predicate": predicate,
-                "object": obj,
-                "context": context.identifier,
-                "termComb": triplePattern,
-                "objLanguage": isinstance(
-                    obj, Literal) and obj.language or None,
-                "objDatatype": isinstance(
-                    obj, Literal) and obj.datatype or None
-            }
-        else:
-            params = {
-                "subject": subject,
-                "predicate": predicate,
-                "object": obj,
-                "context": context.identifier,
-                "termComb": triplePattern
-            }
-        return command, params
-
-    def buildClause(
-            self, table, subject, predicate, obj, context=None,
-            typeTable=False):
-        """Build WHERE clauses for the supplied terms and, context."""
-        if typeTable:
-            clauseList = [
-                self.buildTypeMemberClause(subject, table),
-                self.buildTypeClassClause(obj, table),
-                self.buildContextClause(context, table)
-            ]
-        else:
-            clauseList = [
-                self.buildSubjClause(subject, table),
-                self.buildPredClause(predicate, table),
-                self.buildObjClause(obj, table),
-                self.buildContextClause(context, table),
-                self.buildLitDTypeClause(obj, table),
-                self.buildLitLanguageClause(obj, table)
-            ]
-
-        clauseList = [clause for clause in clauseList if clause is not None]
-        if clauseList:
-            return expression.and_(*clauseList)
-        else:
-            return None
-
-    def buildLitDTypeClause(self, obj, table):
-        """Build Literal and datatype clause."""
-        if isinstance(obj, Literal) and obj.datatype is not None:
-            return table.c.objDatatype == obj.datatype
-        else:
-            return None
-
-    def buildLitLanguageClause(self, obj, table):
-        """Build Literal and language clause."""
-        if isinstance(obj, Literal) and obj.language is not None:
-            return table.c.objLanguage == obj.language
-        else:
-            return None
-
-    # Where Clause  utility Functions
-    # The predicate and object clause builders are modified in order
-    # to optimize subjects and objects utility functions which can
-    # take lists as their last argument (object, predicate -
-    # respectively)
-    def buildSubjClause(self, subject, table):
-        """Build Subject clause."""
-        if isinstance(subject, REGEXTerm):
-            # TODO: this work only in mysql. Must adapt for postgres and sqlite
-            return table.c.subject.op("REGEXP")(subject)
-        elif isinstance(subject, list):
-            # clauseStrings = [] --- unused
-            return expression.or_(
-                *[self.buildSubjClause(s, table) for s in subject if s])
-        elif isinstance(subject, (QuotedGraph, Graph)):
-            return table.c.subject == subject.identifier
-        elif subject is not None:
-            return table.c.subject == subject
-        else:
-            return None
-
-    def buildPredClause(self, predicate, table):
-        """
-        Build Predicate clause.
-
-        Capable of taking a list of predicates as well (in which case
-        subclauses are joined with 'OR')
-        """
-        if isinstance(predicate, REGEXTerm):
-            # TODO: this work only in mysql. Must adapt for postgres and sqlite
-            return table.c.predicate.op("REGEXP")(predicate)
-        elif isinstance(predicate, list):
-            return expression.or_(
-                *[self.buildPredClause(p, table) for p in predicate if p])
-        elif predicate is not None:
-            return table.c.predicate == predicate
-        else:
-            return None
-
-    def buildObjClause(self, obj, table):
-        """
-        Build Object clause.
-
-        Capable of taking a list of objects as well (in which case subclauses
-        are joined with 'OR')
-        """
-        if isinstance(obj, REGEXTerm):
-            # TODO: this work only in mysql. Must adapt for postgres and sqlite
-            return table.c.object.op("REGEXP")(obj)
-        elif isinstance(obj, list):
-            return expression.or_(
-                *[self.buildObjClause(o, table) for o in obj if o])
-        elif isinstance(obj, (QuotedGraph, Graph)):
-            return table.c.object == obj.identifier
-        elif obj is not None:
-            return table.c.object == obj
-        else:
-            return None
-
-    def buildContextClause(self, context, table):
-        """Build Context clause."""
-        if isinstance(context, REGEXTerm):
-            # TODO: this work only in mysql. Must adapt for postgres and sqlite
-            return table.c.context.op("regexp")(context.identifier)
-        elif context is not None and context.identifier is not None:
-            return table.c.context == context.identifier
-        else:
-            return None
-
-    def buildTypeMemberClause(self, subject, table):
-        """Build Type Member clause."""
-        if isinstance(subject, REGEXTerm):
-            # TODO: this work only in mysql. Must adapt for postgres and sqlite
-            return table.c.member.op("regexp")(subject)
-        elif isinstance(subject, list):
-            return expression.or_(
-                *[self.buildTypeMemberClause(s, table) for s in subject if s])
-        elif subject is not None:
-            return table.c.member == subject
-        else:
-            return None
-
-    def buildTypeClassClause(self, obj, table):
-        """Build Type Class clause."""
-        if isinstance(obj, REGEXTerm):
-            # TODO: this work only in mysql. Must adapt for postgres and sqlite
-            return table.c.klass.op("regexp")(obj)
-        elif isinstance(obj, list):
-            return expression.or_(
-                *[self.buildTypeClassClause(o, table) for o in obj if o])
-        elif obj is not None:
-            return obj and table.c.klass == obj
-        else:
-            return None
-
-
-class SQLAlchemy(Store, SQLGenerator):
+class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
     """
     SQL-92 formula-aware implementation of an rdflib Store.
 
@@ -549,19 +78,20 @@ class SQLAlchemy(Store, SQLGenerator):
     regex_matching = PYTHON_REGEX
     configuration = Literal("sqlite://")
 
-    def __init__(self, identifier=None, configuration=None):
+    def __init__(self, identifier=None, configuration=None, engine=None):
         """
         Initialisation.
 
-        identifier: URIRef of the Store. Defaults to CWD
-        configuration: string containing infomation open can use to
-        connect to datastore.
+        Args:
+            identifier (rdflib.URIRef): URIRef of the Store. Defaults to CWD.
+            engine (sqlalchemy.engine.Engine, optional): a `SQLAlchemy.engine.Engine` instance
+
         """
         self.identifier = identifier and identifier or "hardcoded"
+        self.engine = engine
+
         # Use only the first 10 bytes of the digest
-        self._internedId = INTERNED_PREFIX + \
-            hashlib.sha1(
-                self.identifier.encode("utf8")).hexdigest()[:10]
+        self._interned_id = generate_interned_id(self.identifier)
 
         # This parameter controls how exlusively the literal table is searched
         # If true, the Literal partition is searched *exclusively* if the
@@ -580,23 +110,98 @@ class SQLAlchemy(Store, SQLGenerator):
         self.uriCache = {}
         self.bnodeCache = {}
         self.otherCache = {}
-        self.__node_pickler = None
+        self._node_pickler = None
 
-        self.__create_table_definitions()
+        self._create_table_definitions()
 
-        if configuration is not None:
-            self.configuration = configuration
+        # XXX For backward compatibility we still support getting the connection string in constructor
+        # TODO: deprecate this once refactoring is more mature
+        if configuration:
             self.open(configuration)
 
-    def __get_node_pickler(self):
-        if getattr(self, "__node_pickler", False) \
-                or self.__node_pickler is None:
-            from rdflib.term import URIRef
-            from rdflib.graph import GraphValue
-            from rdflib.term import Variable
-            from rdflib.term import Statement
-            from rdflib.store import NodePickler
-            self.__node_pickler = np = NodePickler()
+    def __repr__(self):
+        """Readable serialisation."""
+        quoted_table = self.tables["quoted_statements"]
+        asserted_table = self.tables["asserted_statements"]
+        asserted_type_table = self.tables["type_statements"]
+        literal_table = self.tables["literal_statements"]
+
+        selects = [
+            (expression.alias(asserted_type_table, "typetable"), None, ASSERTED_TYPE_PARTITION),
+            (expression.alias(quoted_table, "quoted"), None, QUOTED_PARTITION),
+            (expression.alias(asserted_table, "asserted"), None, ASSERTED_NON_TYPE_PARTITION),
+            (expression.alias(literal_table, "literal"), None, ASSERTED_LITERAL_PARTITION),
+        ]
+        q = union_select(selects, distinct=False, select_type=COUNT_SELECT)
+        if hasattr(self, "engine"):
+            with self.engine.connect() as connection:
+                res = connection.execute(q)
+                rt = res.fetchall()
+                typeLen, quotedLen, assertedLen, literalLen = [
+                    rtTuple[0] for rtTuple in rt]
+            try:
+                return ("<Partitioned SQL N3 Store: %s " +
+                        "contexts, %s classification assertions, " +
+                        "%s quoted statements, %s property/value " +
+                        "assertions, and %s other assertions>" % (
+                            len([ctx for ctx in self.contexts()]),
+                            typeLen, quotedLen, literalLen, assertedLen))
+            except Exception:
+                return "<Partitioned SQL N3 Store>"
+        else:
+            return "<Partitioned unopened SQL N3 Store>"
+
+    def __len__(self, context=None):
+        """Number of statements in the store."""
+        quoted_table = self.tables["quoted_statements"]
+        asserted_table = self.tables["asserted_statements"]
+        asserted_type_table = self.tables["type_statements"]
+        literal_table = self.tables["literal_statements"]
+
+        typetable = expression.alias(asserted_type_table, "typetable")
+        quoted = expression.alias(quoted_table, "quoted")
+        asserted = expression.alias(asserted_table, "asserted")
+        literal = expression.alias(literal_table, "literal")
+
+        quotedContext = self.build_context_clause(context, quoted)
+        assertedContext = self.build_context_clause(context, asserted)
+        typeContext = self.build_context_clause(context, typetable)
+        literalContext = self.build_context_clause(context, literal)
+
+        if context is not None:
+            selects = [
+                (typetable, typeContext,
+                 ASSERTED_TYPE_PARTITION),
+                (quoted, quotedContext,
+                 QUOTED_PARTITION),
+                (asserted, assertedContext,
+                 ASSERTED_NON_TYPE_PARTITION),
+                (literal, literalContext,
+                 ASSERTED_LITERAL_PARTITION), ]
+            q = union_select(selects, distinct=True, select_type=COUNT_SELECT)
+        else:
+            selects = [
+                (typetable, typeContext,
+                 ASSERTED_TYPE_PARTITION),
+                (asserted, assertedContext,
+                 ASSERTED_NON_TYPE_PARTITION),
+                (literal, literalContext,
+                 ASSERTED_LITERAL_PARTITION), ]
+            q = union_select(selects, distinct=False, select_type=COUNT_SELECT)
+
+        with self.engine.connect() as connection:
+            res = connection.execute(q)
+            rt = res.fetchall()
+            return reduce(lambda x, y: x + y, [rtTuple[0] for rtTuple in rt])
+
+    @property
+    def table_names(self):
+        return get_table_names(interned_id=self._interned_id)
+
+    @property
+    def node_pickler(self):
+        if getattr(self, "_node_pickler", False) or self._node_pickler is None:
+            self._node_pickler = np = NodePickler()
             np.register(self, "S")
             np.register(URIRef, "U")
             np.register(BNode, "B")
@@ -605,210 +210,162 @@ class SQLAlchemy(Store, SQLGenerator):
             np.register(QuotedGraph, "Q")
             np.register(Variable, "V")
             np.register(Statement, "s")
-            np.register(GraphValue, "v")
-        return self.__node_pickler
-    node_pickler = property(__get_node_pickler)
+        return self._node_pickler
 
     def open(self, configuration, create=True):
         """
         Open the store specified by the configuration string.
 
-        If create is True a store will be created if it does not already
-        exist. If create is False and a store does not already exist
-        an exception is raised. An exception is also raised if a store
-        exists, but there is insufficient permissions to open the
-        store.
+        Args:
+            create (bool): If create is True a store will be created if it does not already
+                exist. If create is False and a store does not already exist
+                an exception is raised. An exception is also raised if a store
+                exists, but there is insufficient permissions to open the
+                store.
+
+        Returns:
+            int: CORRUPTED_STORE (0) if database exists but is empty,
+                 VALID_STORE (1) if database exists and tables are all there,
+                 NO_STORE (-1) if nothing exists
+
         """
-        name, opts = _parse_rfc1738_args(configuration)
+        # Close any existing engine connection
+        self.close()
 
         self.engine = sqlalchemy.create_engine(configuration)
-        self.connection = self.engine.connect()
-        if create:
-            self.metadata.create_all(self.engine)
-        self.transaction = self.connection.begin()
+        with self.engine.connect():
+            if create:
+                self.create_all()
 
-        # self._db.create_function("regexp", 2, regexp)
-        if configuration:
-            from sqlalchemy.engine import reflection
-            insp = reflection.Inspector.from_engine(self.engine)
-            tbls = insp.get_table_names()
-            for tn in [tbl % (self._internedId)
-                       for tbl in table_name_prefixes]:
-                if tn not in tbls:
-                    sys.stderr.write("table %s Doesn't exist\n" % (tn))
-                    # The database exists, but one of the partitions
-                    # doesn't exist
-                    return 0
-            # Everything is there (the database and the partitions)
-            return 1
-        # The database doesn't exist - nothing is there
-        return -1
+            ret_value = self._verify_store_exists()
 
-    def commit(self):
-        """
-        Try to commit the triples added with add()
-        """
-        try:
-            self.transaction.commit()
-            # Begin new transaction
-            self.transaction = self.connection.begin()
-        except Exception:
-            e = sys.exc_info()[1]
-            msg = e.args[0] if len(e.args) > 0 else ''
-            _logger.debug("commit failed %s" % msg)
-            self.transaction.rollback()
-            raise
+        if ret_value != VALID_STORE and not create:
+            raise RuntimeError("open() - create flag was set to False, but store was not created previously.")
+
+        return ret_value
+
+    def create_all(self):
+        """Create all of the database tables (idempotent)."""
+        self.metadata.create_all(self.engine)
 
     def close(self, commit_pending_transaction=False):
-        """FIXME:  Add documentation."""
-        try:
-            self.engine.close()
-        except:
-            pass
+        """
+        Close the current store engine connection if one is open.
+
+        """
+        self.engine = None
 
     def destroy(self, configuration):
-        """FIXME: Add documentation."""
-        name, opts = _parse_rfc1738_args(configuration)
+        """
+        Delete all tables and stored data associated with the store.
+
+        """
         if self.engine is None:
-            # _logger.debug("Connecting in order to destroy.")
-            self.engine = sqlalchemy.create_engine(configuration)
-        #     _logger.debug("Connected")
+            self.engine = self.open(configuration, create=False)
 
-        try:
-            self.transaction.commit()
-            self.transaction.begin()
-            self.metadata.drop_all(self.engine)
-            self.transaction.commit()
-        except Exception:
-            e = sys.exc_info()[1]
-            msg = e.args[0] if len(e.args) > 0 else ""
-            _logger.debug("unable to drop table: %s " % (msg))
-            self.transaction.rollback()
-
-        # Note, this only removes the associated tables for the closed
-        # world universe given by the identifier
-        # _logger.debug(
-        #       "Destroyed Close World Universe %s" % (self.identifier))
-
-    def __getBuildCommand(self, triple, context=None, quoted=False):
-
-        subject, predicate, obj = triple
-        buildCommandType = None
-        if quoted or predicate != RDF.type:
-            # Quoted statement or non rdf:type predicate
-            # check if object is a literal
-            if isinstance(obj, Literal):
-                addCmd, params = self.buildLiteralTripleSQLCommand(
-                    subject, predicate, obj, context)
-                buildCommandType = "literal"
-            else:
-                addCmd, params = self.buildTripleSQLCommand(
-                    subject, predicate, obj, context, quoted)
-                buildCommandType = "other"
-        elif predicate == RDF.type:
-            # asserted rdf:type statement
-            addCmd, params = self.buildTypeSQLCommand(subject, obj, context)
-            buildCommandType = "type"
-        return buildCommandType, addCmd, params
+        with self.engine.connect() as connection:
+            trans = connection.begin()
+            try:
+                self.metadata.drop_all(self.engine)
+                trans.commit()
+            except Exception:
+                _logger.exception("unable to drop table.")
+                trans.rollback()
 
     # Triple Methods
+
     def add(self, triple, context=None, quoted=False):
         """Add a triple to the store of triples."""
         subject, predicate, obj = triple
-        _, addCmd, params = self.__getBuildCommand(
-            (subject, predicate, obj), context, quoted)
-       
+        _, statement, params = self._get_build_command(
+            (subject, predicate, obj),
+            context, quoted,
+        )
 
-        try:
-            self.connection.execute(addCmd, params)
-        except Exception:
-            e = sys.exc_info()[1]
-            msg = e.args[0] if len(e.args) > 0 else ""
-            _logger.debug(
-                "Add failed %s with commands %s params %s" % (
-                    msg, str(addCmd), repr(params)))
-            raise
+        with self.engine.connect() as connection:
+            try:
+                connection.execute(statement, params)
+            except Exception:
+                _logger.exception(
+                    "Add failed with statement: %s, params: %s",
+                    str(statement), repr(params)
+                )
+                raise
 
     def addN(self, quads):
         """Add a list of triples in quads form."""
-        cmdTripleDict = {}
-
+        commands_dict = {}
         for subject, predicate, obj, context in quads:
-            buildCommandType, cmd, params = \
-                self.__getBuildCommand(
-                    (subject, predicate, obj),
-                    context,
-                    isinstance(context, QuotedGraph))
+            command_type, statement, params = self._get_build_command(
+                (subject, predicate, obj),
+                context,
+                isinstance(context, QuotedGraph),
+            )
 
-            cmdTriple = cmdTripleDict.setdefault(buildCommandType, {})
-            cmdTriple.setdefault("cmd", cmd)
-            cmdTriple.setdefault("params", []).append(params)
+            command_dict = commands_dict.setdefault(command_type, {})
+            command_dict.setdefault("statement", statement)
+            command_dict.setdefault("params", []).append(params)
 
-        try:
-            for cmdTriple in cmdTripleDict.values():
-                self.connection.execute(cmdTriple["cmd"], cmdTriple["params"])
-            self.transaction.commit()
-            # Begin new transaction
-            self.transaction = self.connection.begin()
-        except Exception:
-            e = sys.exc_info()[1]
-            msg = e.args[0] if len(e.args) > 0 else ""
-            _logger.debug("AddN failed %s" % msg)
-            self.transaction.rollback()
-            raise
+        with self.engine.connect() as connection:
+            trans = connection.begin()
+            try:
+                for command in commands_dict.values():
+                    ### "Big Data" hack:
+                    ### Causes large INSERT statements to be created instead of too many INSERTS
+                    connection.execute(command["statement"].values(command["params"]))
+                trans.commit()
+            except Exception:
+                _logger.exception("AddN failed.")
+                trans.rollback()
+                raise
 
     def remove(self, triple, context):
         """Remove a triple from the store."""
         subject, predicate, obj = triple
+
         if context is not None:
             if subject is None and predicate is None and object is None:
                 self._remove_context(context)
                 return
+
         quoted_table = self.tables["quoted_statements"]
         asserted_table = self.tables["asserted_statements"]
         asserted_type_table = self.tables["type_statements"]
         literal_table = self.tables["literal_statements"]
-        self.transaction = self.connection.begin()
-        try:
-            if not predicate or predicate != RDF.type:
-                #Need to remove predicates other than rdf:type
 
-                if not self.STRONGLY_TYPED_TERMS \
-                        or isinstance(obj, Literal):
-                    #remove literal triple
-                    clause = self.buildClause(
-                        literal_table, subject, predicate, obj, context)
-                    self.connection.execute(literal_table.delete(clause))
+        with self.engine.connect() as connection:
+            trans = connection.begin()
+            try:
+                if not predicate or predicate != RDF.type:
+                    # Need to remove predicates other than rdf:type
 
-                for table in [quoted_table, asserted_table]:
-                    # If asserted non rdf:type table and obj is Literal,
-                    # don't do anything (already taken care of)
-                    if table == asserted_table \
-                            and isinstance(obj, Literal):
-                        continue
-                    else:
-                        clause = self.buildClause(
-                            table, subject, predicate, obj, context)
-                        self.connection.execute(table.delete(clause))
+                    if not self.STRONGLY_TYPED_TERMS or isinstance(obj, Literal):
+                        # remove literal triple
+                        clause = self.build_clause(literal_table, subject, predicate, obj, context)
+                        connection.execute(literal_table.delete(clause))
 
-            if predicate == RDF.type or not predicate:
-                # Need to check rdf:type and quoted partitions (in addition
-                # perhaps)
-                clause = self.buildClause(
-                    asserted_type_table, subject,
-                    RDF.type, obj, context, True)
-                self.connection.execute(asserted_type_table.delete(clause))
+                    for table in [quoted_table, asserted_table]:
+                        # If asserted non rdf:type table and obj is Literal,
+                        # don't do anything (already taken care of)
+                        if table == asserted_table and isinstance(obj, Literal):
+                            continue
+                        else:
+                            clause = self.build_clause(table, subject, predicate, obj, context)
+                            connection.execute(table.delete(clause))
 
-                clause = self.buildClause(
-                    quoted_table, subject, predicate, obj, context)
-                self.connection.execute(quoted_table.delete(clause))
+                if predicate == RDF.type or not predicate:
+                    # Need to check rdf:type and quoted partitions (in addition
+                    # perhaps)
+                    clause = self.build_clause(asserted_type_table, subject, RDF.type, obj, context, True)
+                    connection.execute(asserted_type_table.delete(clause))
 
-            self.transaction.commit()
-        except Exception:
-            e = sys.exc_info()[1]
-            msg = e.args[0] if len(e.args) > 0 else ""
-            _logger.debug("Removal failed %s" % msg)
-            self.transaction.rollback()
+                    clause = self.build_clause(quoted_table, subject, predicate, obj, context)
+                    connection.execute(quoted_table.delete(clause))
+
+                trans.commit()
+            except Exception:
+                _logger.exception("Removal failed.")
+                trans.rollback()
 
     def triples(self, triple, context=None):
         """
@@ -821,9 +378,10 @@ class SQLAlchemy(Store, SQLGenerator):
         asserted rdf:type table:     <id>_type_statements
         asserted non rdf:type table: <id>_asserted_statements
 
-        triple columns: subject,predicate,object,context,termComb,
-                        objLanguage,objDatatype
-        class membership columns: member,klass,context termComb
+        triple columns:
+            subject, predicate, object, context, termComb, objLanguage, objDatatype
+        class membership columns:
+            member, klass, context, termComb
 
         FIXME:  These union all selects *may* be further optimized by joins
 
@@ -840,8 +398,7 @@ class SQLAlchemy(Store, SQLGenerator):
             # (if a context is specified)
             typeTable = expression.alias(
                 asserted_type_table, "typetable")
-            clause = self.buildClause(
-                typeTable, subject, RDF.type, obj, context, True)
+            clause = self.build_clause(typeTable, subject, RDF.type, obj, context, True)
             selects = [
                 (typeTable,
                  clause,
@@ -859,21 +416,18 @@ class SQLAlchemy(Store, SQLGenerator):
                     or not obj \
                     or (self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm)):
                 literal = expression.alias(literal_table, "literal")
-                clause = self.buildClause(
-                    literal, subject, predicate, obj, context)
+                clause = self.build_clause(literal, subject, predicate, obj, context)
                 selects.append((literal, clause, ASSERTED_LITERAL_PARTITION))
 
             if not isinstance(obj, Literal) \
                     and not (isinstance(obj, REGEXTerm) and self.STRONGLY_TYPED_TERMS) \
                     or not obj:
                 asserted = expression.alias(asserted_table, "asserted")
-                clause = self.buildClause(
-                    asserted, subject, predicate, obj, context)
+                clause = self.build_clause(asserted, subject, predicate, obj, context)
                 selects.append((asserted, clause, ASSERTED_NON_TYPE_PARTITION))
 
             typeTable = expression.alias(asserted_type_table, "typetable")
-            clause = self.buildClause(
-                typeTable, subject, RDF.type, obj, context, True)
+            clause = self.build_clause(typeTable, subject, RDF.type, obj, context, True)
             selects.append((typeTable, clause, ASSERTED_TYPE_PARTITION))
 
         elif predicate:
@@ -886,41 +440,47 @@ class SQLAlchemy(Store, SQLGenerator):
                     or not obj \
                     or (self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm)):
                 literal = expression.alias(literal_table, "literal")
-                clause = self.buildClause(
-                    literal, subject, predicate, obj, context)
+                clause = self.build_clause(literal, subject, predicate, obj, context)
                 selects.append((literal, clause, ASSERTED_LITERAL_PARTITION))
 
             if not isinstance(obj, Literal) \
                     and not (isinstance(obj, REGEXTerm) and self.STRONGLY_TYPED_TERMS) \
                     or not obj:
                 asserted = expression.alias(asserted_table, "asserted")
-                clause = self.buildClause(
-                    asserted, subject, predicate, obj, context)
+                clause = self.build_clause(asserted, subject, predicate, obj, context)
                 selects.append((asserted, clause, ASSERTED_NON_TYPE_PARTITION))
 
         if context is not None:
             quoted = expression.alias(quoted_table, "quoted")
-            clause = self.buildClause(quoted, subject, predicate, obj, context)
+            clause = self.build_clause(quoted, subject, predicate, obj, context)
             selects.append((quoted, clause, QUOTED_PARTITION))
 
-        q = unionSELECT(selects, selectType=TRIPLE_SELECT_NO_ORDER)
-        res = self.connection.execute(q)
-        result = res.fetchall()
+        q = union_select(selects, select_type=TRIPLE_SELECT_NO_ORDER)
+        with self.engine.connect() as connection:
+            ### This causes the database to stream the results to Python via a serverside cursor
+            res = (connection.execution_options(stream_results=True).execute(q))
 
-        tripleCoverage = {}
-        for rt in result:
-            if __version__ <= "0.2":
-                s, p, o, (graphKlass, idKlass, graphId) = \
-                    extractTriple(rt, self, context)
-            else:
-                id, s, p, o, (graphKlass, idKlass, graphId) = \
-                    extractTriple(rt, self, context)
-            contexts = tripleCoverage.get((s, p, o), [])
-            contexts.append(graphKlass(self, idKlass(graphId)))
-            tripleCoverage[(s, p, o)] = contexts
+            # TODO: False but it may have limitations on text column. Check
+            # NOTE: SQLite does not support ORDER BY terms that aren't
+            # integers, so the entire result set must be iterated in order
+            # to be able to return a generator of contexts
 
-        for (s, p, o), contexts in tripleCoverage.items():
-            yield (s, p, o), (c for c in contexts)
+            while True:
+                result = res.fetchmany(1000)
+                if not result:
+                    break
+                tripleCoverage = {}
+
+                for rt in result:
+                    id, s, p, o, (graphKlass, idKlass, graphId) = extract_triple(rt, self, context)
+                    contexts = tripleCoverage.get((s, p, o), [])
+                    contexts.append(graphKlass(self, idKlass(graphId)))
+                    tripleCoverage[(s, p, o)] = contexts
+
+                for (s, p, o), contexts in tripleCoverage.items():
+                    yield (s, p, o), (c for c in contexts)
+
+                del result
 
     def triples_choices(self, triple, context=None):
         """
@@ -962,82 +522,7 @@ class SQLAlchemy(Store, SQLGenerator):
                     (subject, predicate, object_), context):
                 yield (s1, p1, o1), cg
 
-    def __repr__(self):
-        """Readable serialisation."""
-        quoted_table = self.tables["quoted_statements"]
-        asserted_table = self.tables["asserted_statements"]
-        asserted_type_table = self.tables["type_statements"]
-        literal_table = self.tables["literal_statements"]
-
-        selects = [
-            (expression.alias(asserted_type_table, "typetable"),
-                None, ASSERTED_TYPE_PARTITION),
-            (expression.alias(quoted_table, "quoted"),
-                None, QUOTED_PARTITION),
-            (expression.alias(asserted_table, "asserted"),
-                None, ASSERTED_NON_TYPE_PARTITION),
-            (expression.alias(literal_table, "literal"),
-                None, ASSERTED_LITERAL_PARTITION), ]
-        q = unionSELECT(selects, distinct=False, selectType=COUNT_SELECT)
-
-        res = self.connection.execute(q)
-        rt = res.fetchall()
-        typeLen, quotedLen, assertedLen, literalLen = [
-            rtTuple[0] for rtTuple in rt]
-        try:
-            return ("<Partitioned SQL N3 Store: %s " +
-                    "contexts, %s classification assertions, " +
-                    "%s quoted statements, %s property/value " +
-                    "assertions, and %s other assertions>" % (
-                        len([ctx for ctx in self.contexts()]),
-                        typeLen, quotedLen, literalLen, assertedLen))
-        except Exception:
-            return "<Partitioned SQL N3 Store>"
-
-    def __len__(self, context=None):
-        """Number of statements in the store."""
-        quoted_table = self.tables["quoted_statements"]
-        asserted_table = self.tables["asserted_statements"]
-        asserted_type_table = self.tables["type_statements"]
-        literal_table = self.tables["literal_statements"]
-
-        typetable = expression.alias(asserted_type_table, "typetable")
-        quoted = expression.alias(quoted_table, "quoted")
-        asserted = expression.alias(asserted_table, "asserted")
-        literal = expression.alias(literal_table, "literal")
-
-        quotedContext = self.buildContextClause(context, quoted)
-        assertedContext = self.buildContextClause(context, asserted)
-        typeContext = self.buildContextClause(context, typetable)
-        literalContext = self.buildContextClause(context, literal)
-
-        if context is not None:
-            selects = [
-                (typetable, typeContext,
-                 ASSERTED_TYPE_PARTITION),
-                (quoted, quotedContext,
-                 QUOTED_PARTITION),
-                (asserted, assertedContext,
-                 ASSERTED_NON_TYPE_PARTITION),
-                (literal, literalContext,
-                 ASSERTED_LITERAL_PARTITION), ]
-            q = unionSELECT(selects, distinct=True, selectType=COUNT_SELECT)
-        else:
-            selects = [
-                (typetable, typeContext,
-                 ASSERTED_TYPE_PARTITION),
-                (asserted, assertedContext,
-                 ASSERTED_NON_TYPE_PARTITION),
-                (literal, literalContext,
-                 ASSERTED_LITERAL_PARTITION), ]
-            q = unionSELECT(selects, distinct=False, selectType=COUNT_SELECT)
-
-        res = self.connection.execute(q)
-        rt = res.fetchall()
-        return reduce(lambda x, y: x + y, [rtTuple[0] for rtTuple in rt])
-
     def contexts(self, triple=None):
-        """Contexts."""
         quoted_table = self.tables["quoted_statements"]
         asserted_table = self.tables["asserted_statements"]
         asserted_type_table = self.tables["type_statements"]
@@ -1053,8 +538,7 @@ class SQLAlchemy(Store, SQLGenerator):
             if predicate == RDF.type:
                 # Select from asserted rdf:type partition and quoted table
                 # (if a context is specified)
-                clause = self.buildClause(
-                    typetable, subject, RDF.type, obj, Any, True)
+                clause = self.build_clause(typetable, subject, RDF.type, obj, Any, True)
                 selects = [(typetable, clause, ASSERTED_TYPE_PARTITION), ]
 
             elif isinstance(predicate, REGEXTerm) \
@@ -1064,24 +548,21 @@ class SQLAlchemy(Store, SQLGenerator):
                 # literal partition if (obj is Literal or None) and
                 # asserted non rdf:type partition (if obj is URIRef
                 # or None)
-                clause = self.buildClause(
-                    typetable, subject, RDF.type, obj, Any, True)
+                clause = self.build_clause(typetable, subject, RDF.type, obj, Any, True)
                 selects = [(typetable, clause, ASSERTED_TYPE_PARTITION), ]
 
                 if (not self.STRONGLY_TYPED_TERMS or
                         isinstance(obj, Literal) or
                         not obj or
                         (self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm))):
-                    clause = self.buildClause(literal, subject, predicate, obj)
+                    clause = self.build_clause(literal, subject, predicate, obj)
                     selects.append(
                         (literal, clause, ASSERTED_LITERAL_PARTITION))
                 if not isinstance(obj, Literal) \
                         and not (isinstance(obj, REGEXTerm) and self.STRONGLY_TYPED_TERMS) \
                         or not obj:
-                    clause = self.buildClause(
-                        asserted, subject, predicate, obj)
-                    selects.append(
-                        (asserted, clause, ASSERTED_NON_TYPE_PARTITION))
+                    clause = self.build_clause(asserted, subject, predicate, obj)
+                    selects.append((asserted, clause, ASSERTED_NON_TYPE_PARTITION))
 
             elif predicate:
                 # select from asserted non rdf:type partition (optionally),
@@ -1092,56 +573,35 @@ class SQLAlchemy(Store, SQLGenerator):
                         isinstance(obj, Literal) or
                         not obj
                         or (self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm))):
-                    clause = self.buildClause(
-                        literal, subject, predicate, obj)
+                    clause = self.build_clause(literal, subject, predicate, obj)
                     selects.append(
                         (literal, clause, ASSERTED_LITERAL_PARTITION))
                 if not isinstance(obj, Literal) \
                         and not (isinstance(obj, REGEXTerm) and self.STRONGLY_TYPED_TERMS) \
                         or not obj:
-                    clause = self.buildClause(
-                        asserted, subject, predicate, obj)
+                    clause = self.build_clause(asserted, subject, predicate, obj)
                     selects.append(
                         (asserted, clause, ASSERTED_NON_TYPE_PARTITION))
 
-            clause = self.buildClause(quoted, subject, predicate, obj)
+            clause = self.build_clause(quoted, subject, predicate, obj)
             selects.append((quoted, clause, QUOTED_PARTITION))
-            q = unionSELECT(selects, distinct=True, selectType=CONTEXT_SELECT)
+            q = union_select(selects, distinct=True, select_type=CONTEXT_SELECT)
         else:
             selects = [
                 (typetable, None, ASSERTED_TYPE_PARTITION),
                 (quoted, None, QUOTED_PARTITION),
                 (asserted, None, ASSERTED_NON_TYPE_PARTITION),
                 (literal, None, ASSERTED_LITERAL_PARTITION), ]
-            q = unionSELECT(selects, distinct=True, selectType=CONTEXT_SELECT)
+            q = union_select(selects, distinct=True, select_type=CONTEXT_SELECT)
 
-        res = self.connection.execute(q)
-        rt = res.fetchall()
+        with self.engine.connect() as connection:
+            res = connection.execute(q)
+            rt = res.fetchall()
         for context in [rtTuple[0] for rtTuple in rt]:
             yield URIRef(context)
 
-    def _remove_context(self, identifier):
-        """Remove context."""
-        assert identifier
-        quoted_table = self.tables["quoted_statements"]
-        asserted_table = self.tables["asserted_statements"]
-        asserted_type_table = self.tables["type_statements"]
-        literal_table = self.tables["literal_statements"]
-
-        self.transaction = self.connection.begin()
-        try:
-            for table in [quoted_table, asserted_table,
-                          asserted_type_table, literal_table]:
-                clause = self.buildContextClause(identifier, table)
-                self.connection.execute(table.delete(clause))
-            self.transaction.commit()
-        except Exception:
-            e = sys.exc_info()[1]
-            msg = e.args[0] if len(e.args) > 0 else ""
-            _logger.debug("Context removal failed %s" % msg)
-            self.transaction.rollback()
-
     # Optional Namespace methods
+
     # Placeholder optimized interfaces (those needed in order to port Versa)
     def subjects(self, predicate=None, obj=None):
         """A generator of subjects with the given predicate and object."""
@@ -1166,7 +626,7 @@ class SQLAlchemy(Store, SQLGenerator):
         raise Exception("Not implemented")
 
     def value(self, subject,
-              predicate="http://www.w3.org/1999/02/22-rdf-syntax-ns#value",
+              predicate=u"http://www.w3.org/1999/02/22-rdf-syntax-ns#value",
               object=None, default=None, any=False):
         """
         Get a value.
@@ -1189,139 +649,138 @@ class SQLAlchemy(Store, SQLGenerator):
         raise Exception("Not implemented")
 
     # Namespace persistence interface implementation
+
     def bind(self, prefix, namespace):
         """Bind prefix for namespace."""
-
-        try:
-            ins = self.tables["namespace_binds"].insert().values(
-                prefix=prefix, uri=namespace)
-            self.connection.execute(ins)
-        except Exception:
-            e = sys.exc_info()[1]
-            msg = e.args[0] if len(e.args) > 0 else ""
-            _logger.debug("Namespace binding failed %s" % msg)
+        with self.engine.connect() as connection:
+            try:
+                ins = self.tables["namespace_binds"].insert().values(
+                    prefix=prefix, uri=namespace)
+                connection.execute(ins)
+            except Exception:
+                _logger.exception("Namespace binding failed.")
 
     def prefix(self, namespace):
         """Prefix."""
-
-        nb_table = self.tables["namespace_binds"]
-        namespace = text_type(namespace)
-        s = select([nb_table.c.prefix]).where(nb_table.c.uri == namespace)
-        res = self.connection.execute(s)
-        rt = [rtTuple[0] for rtTuple in res.fetchall()]
-        res.close()
-        return rt and rt[0] or None
+        with self.engine.connect() as connection:
+            nb_table = self.tables["namespace_binds"]
+            namespace = text_type(namespace)
+            s = select([nb_table.c.prefix]).where(nb_table.c.uri == namespace)
+            res = connection.execute(s)
+            rt = [rtTuple[0] for rtTuple in res.fetchall()]
+            res.close()
+            return rt and rt[0] or None
 
     def namespace(self, prefix):
-        """Namespace."""
         res = None
         prefix_val = text_type(prefix)
         try:
-            nb_table = self.tables["namespace_binds"]
-            s = select([nb_table.c.uri]).where(nb_table.c.prefix == prefix_val)
-            res = self.connection.execute(s)
-            rt = [rtTuple[0] for rtTuple in res.fetchall()]
-            res.close()
-            from rdflib import URIRef
-            return rt and URIRef(rt[0]) or None
+            with self.engine.connect() as connection:
+                nb_table = self.tables["namespace_binds"]
+                s = select([nb_table.c.uri]).where(nb_table.c.prefix == prefix_val)
+                res = connection.execute(s)
+                rt = [rtTuple[0] for rtTuple in res.fetchall()]
+                res.close()
+                return rt and URIRef(rt[0]) or None
         except:
             return None
 
     def namespaces(self):
-        """Namespaces."""
-        res = self.connection.execute(self.tables["namespace_binds"].select())
-        for prefix, uri in res.fetchall():
-            yield prefix, uri
+        with self.engine.connect() as connection:
+            res = connection.execute(self.tables["namespace_binds"].select())
+            for prefix, uri in res.fetchall():
+                yield prefix, uri
 
-    def __create_table_definitions(self):
+    # Private methods
+
+    def _create_table_definitions(self):
         self.metadata = MetaData()
         self.tables = {
-            "asserted_statements":
-            Table(
-                "%s_asserted_statements" % self._internedId, self.metadata,
-                Column("id", types.Integer, nullable=False, primary_key=True),
-                Column("subject", TermType, nullable=False),
-                Column("predicate", TermType, nullable=False),
-                Column("object", TermType, nullable=False),
-                Column("context", TermType, nullable=False),
-                Column("termcomb", types.Integer,
-                       nullable=False, key="termComb"),
-                Index("%s_A_termComb_index" % self._internedId,
-                      "termComb"),
-                Index("%s_A_s_index" % self._internedId, "subject", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_A_p_index" % self._internedId, "predicate", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_A_o_index" % self._internedId, "object", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_A_c_index" % self._internedId, "context", mysql_length=MYSQL_MAX_INDEX_LENGTH)),
-            "type_statements":
-            Table("%s_type_statements" % self._internedId, self.metadata,
-                  Column("id", types.Integer, nullable=False, primary_key=True),
-                  Column("member", TermType, nullable=False),
-                  Column("klass", TermType, nullable=False),
-                  Column("context", TermType, nullable=False),
-                  Column("termcomb", types.Integer, nullable=False,
-                         key="termComb"),
-                  Index("%s_T_termComb_index" % self._internedId,
-                        "termComb"),
-                  Index("%s_member_index" % self._internedId, "member", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                  Index("%s_klass_index" % self._internedId, "klass", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                  Index("%s_c_index" % self._internedId, "context", mysql_length=MYSQL_MAX_INDEX_LENGTH)),
-            "literal_statements":
-            Table(
-                "%s_literal_statements" % self._internedId, self.metadata,
-                Column("id", types.Integer, nullable=False, primary_key=True),
-                Column("subject", TermType, nullable=False),
-                Column("predicate", TermType, nullable=False),
-                Column("object", TermType),
-                Column("context", TermType, nullable=False),
-                Column("termcomb", types.Integer, nullable=False,
-                       key="termComb"),
-                Column("objlanguage", types.String(255),
-                       key="objLanguage"),
-                Column("objdatatype", types.String(255),
-                       key="objDatatype"),
-                Index("%s_L_termComb_index" % self._internedId,
-                      "termComb"),
-                Index("%s_L_s_index" % self._internedId, "subject", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_L_p_index" % self._internedId, "predicate", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_L_c_index" % self._internedId, "context", mysql_length=MYSQL_MAX_INDEX_LENGTH)),
-            "quoted_statements":
-            Table(
-                "%s_quoted_statements" % self._internedId, self.metadata,
-                Column("id", types.Integer, nullable=False, primary_key=True),
-                Column("subject", TermType, nullable=False),
-                Column("predicate", TermType, nullable=False),
-                Column("object", TermType),
-                Column("context", TermType, nullable=False),
-                Column("termcomb", types.Integer, nullable=False,
-                       key="termComb"),
-                Column("objlanguage", types.String(255),
-                       key="objLanguage"),
-                Column("objdatatype", types.String(255),
-                       key="objDatatype"),
-                Index("%s_Q_termComb_index" % self._internedId,
-                      "termComb"),
-                Index("%s_Q_s_index" % self._internedId, "subject", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_Q_p_index" % self._internedId, "predicate", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_Q_o_index" % self._internedId, "object", mysql_length=MYSQL_MAX_INDEX_LENGTH),
-                Index("%s_Q_c_index" % self._internedId, "context", mysql_length=MYSQL_MAX_INDEX_LENGTH)),
-            "namespace_binds":
-            Table(
-                "%s_namespace_binds" % self._internedId, self.metadata,
-                Column("prefix", types.String(20), unique=True,
-                       nullable=False, primary_key=True),
-                Column("uri", types.Text),
-                Index("%s_uri_index" % self._internedId, "uri", mysql_length=MYSQL_MAX_INDEX_LENGTH))
+            "asserted_statements": create_asserted_statements_table(self._interned_id, self.metadata),
+            "type_statements": create_type_statements_table(self._interned_id, self.metadata),
+            "literal_statements": create_literal_statements_table(self._interned_id, self.metadata),
+            "quoted_statements": create_quoted_statements_table(self._interned_id, self.metadata),
+            "namespace_binds": create_namespace_binds_table(self._interned_id, self.metadata),
         }
-        if __version__ > "0.2":
-            for table in ["type_statements", "literal_statements",
-                          "quoted_statements", "asserted_statements"]:
-                self.tables[table].append_column(
-                    Column("id", types.Integer, nullable=False, primary_key=True))
 
-table_name_prefixes = [
-    "%s_asserted_statements",
-    "%s_type_statements",
-    "%s_quoted_statements",
-    "%s_namespace_binds",
-    "%s_literal_statements"
-]
+    def _get_build_command(self, triple, context=None, quoted=False):
+        """
+        Assemble the SQL Query text for adding an RDF triple to store.
+
+        :param triple {tuple} - tuple of (subject, predicate, object) objects to add
+        :param context - a `rdflib.URIRef` identifier for the graph namespace
+        :param quoted {bool} - whether should treat as a quoted statement
+
+        :returns {tuple} of (command_type, add_command, params):
+            command_type: which kind of statement it is: literal, type, other
+            statement: the literal SQL statement to execute (with unbound variables)
+            params: the parameters for the SQL statement (e.g the variables to bind)
+
+        """
+        subject, predicate, obj = triple
+        command_type = None
+        if quoted or predicate != RDF.type:
+            # Quoted statement or non rdf:type predicate
+            # check if object is a literal
+            if isinstance(obj, Literal):
+                statement, params = self._build_literal_triple_sql_command(
+                    subject,
+                    predicate,
+                    obj,
+                    context,
+                )
+                command_type = "literal"
+            else:
+                statement, params = self._build_triple_sql_command(
+                    subject,
+                    predicate,
+                    obj,
+                    context,
+                    quoted,
+                )
+                command_type = "other"
+        elif predicate == RDF.type:
+            # asserted rdf:type statement
+            statement, params = self._build_type_sql_command(
+                subject,
+                obj,
+                context,
+            )
+            command_type = "type"
+        return command_type, statement, params
+
+    def _remove_context(self, identifier):
+        """Remove context."""
+        assert identifier
+        quoted_table = self.tables["quoted_statements"]
+        asserted_table = self.tables["asserted_statements"]
+        asserted_type_table = self.tables["type_statements"]
+        literal_table = self.tables["literal_statements"]
+
+        with self.engine.connect() as connection:
+            trans = connection.begin()
+            try:
+                for table in [quoted_table, asserted_table,
+                              asserted_type_table, literal_table]:
+                    clause = self.build_context_clause(identifier, table)
+                    connection.execute(table.delete(clause))
+                trans.commit()
+            except Exception:
+                _logger.exception("Context removal failed.")
+                trans.rollback()
+
+    def _verify_store_exists(self):
+        """
+        Verify store (e.g. all tables) exist.
+
+        """
+
+        inspector = reflection.Inspector.from_engine(self.engine)
+        existing_table_names = inspector.get_table_names()
+        for table_name in self.table_names:
+            if table_name not in existing_table_names:
+                _logger.critical("create_all() - table %s Doesn't exist!", table_name)
+                # The database exists, but one of the tables doesn't exist
+                return CORRUPTED_STORE
+
+        return VALID_STORE

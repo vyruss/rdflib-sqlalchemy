@@ -1,66 +1,23 @@
 """Convenience functions for working with Terms and Graphs."""
-from rdflib import BNode
-from rdflib import Graph
-from rdflib import Literal
-from rdflib import URIRef
-from rdflib import Variable
+from rdflib import BNode, Graph, Literal, URIRef, Variable
 from rdflib.graph import QuotedGraph
 from rdflib.py3compat import format_doctest_out
 from rdflib.term import Statement
 
+from rdflib_sqlalchemy.constants import (
+    TERM_COMBINATIONS,
+    TERM_INSTANTIATION_DICT,
+    REVERSE_TERM_COMBINATIONS,
+)
 
-__all__ = ["SUBJECT", "PREDICATE", "OBJECT", "CONTEXT", "TERM_COMBINATIONS",
-           "REVERSE_TERM_COMBINATIONS", "TERM_INSTANTIATION_DICT",
-           "GRAPH_TERM_DICT", "normalizeGraph", "term2Letter",
-           "constructGraph", "triplePattern2termCombinations",
-           "type2TermCombination", "statement2TermCombination",
-           "escape_quotes"]
+
+__all__ = ["extract_triple"]
+
 
 SUBJECT = 0
 PREDICATE = 1
 OBJECT = 2
 CONTEXT = 3
-TERM_COMBINATIONS = dict([(term, index) for index, term, in enumerate([
-     "UUUU", "UUUB", "UUUF", "UUVU", "UUVB", "UUVF", "UUBU", "UUBB", "UUBF",
-     "UULU", "UULB", "UULF", "UUFU", "UUFB", "UUFF",
-     #
-     "UVUU", "UVUB", "UVUF", "UVVU", "UVVB", "UVVF", "UVBU", "UVBB", "UVBF",
-     "UVLU", "UVLB", "UVLF", "UVFU", "UVFB", "UVFF",
-     #
-     "VUUU", "VUUB", "VUUF", "VUVU", "VUVB", "VUVF", "VUBU", "VUBB", "VUBF",
-     "VULU", "VULB", "VULF", "VUFU", "VUFB", "VUFF",
-     #
-     "VVUU", "VVUB", "VVUF", "VVVU", "VVVB", "VVVF", "VVBU", "VVBB", "VVBF",
-     "VVLU", "VVLB", "VVLF", "VVFU", "VVFB", "VVFF",
-     #
-     "BUUU", "BUUB", "BUUF", "BUVU", "BUVB", "BUVF", "BUBU", "BUBB", "BUBF",
-     "BULU", "BULB", "BULF", "BUFU", "BUFB", "BUFF",
-     #
-     "BVUU", "BVUB", "BVUF", "BVVU", "BVVB", "BVVF", "BVBU", "BVBB", "BVBF",
-     "BVLU", "BVLB", "BVLF", "BVFU", "BVFB", "BVFF",
-     #
-     "FUUU", "FUUB", "FUUF", "FUVU", "FUVB", "FUVF", "FUBU", "FUBB", "FUBF",
-     "FULU", "FULB", "FULF", "FUFU", "FUFB", "FUFF",
-     #
-     "FVUU", "FVUB", "FVUF", "FVVU", "FVVB", "FVVF", "FVBU", "FVBB", "FVBF",
-     "FVLU", "FVLB", "FVLF", "FVFU", "FVFB", "FVFF",
-     #
-     # "sUUU", "sUUB", "sUUF", "sUVU", "sUVB", "sUVF", "sUBU", "sUBB", "sUBF",
-     # "sULU", "sULB", "sULF", "sUFU", "sUFB", "sUFF",
-     #
-     # "sVUU", "sVUB", "sVUF", "sVVU", "sVVB", "sVVF", "sVBU", "sVBB", "sVBF",
-     # "sVLU", "sVLB", "sVLF", "sVFU", "sVFB", "sVFF"
-])])
-
-REVERSE_TERM_COMBINATIONS = dict(
-    [(value, key) for key, value in TERM_COMBINATIONS.items()])
-
-TERM_INSTANTIATION_DICT = {
-    "U": URIRef,
-    "B": BNode,
-    "V": Variable,
-    "L": Literal
-}
 
 GRAPH_TERM_DICT = {
     "F": (QuotedGraph, URIRef),
@@ -70,7 +27,7 @@ GRAPH_TERM_DICT = {
 
 
 @format_doctest_out
-def normalizeGraph(graph):
+def normalize_graph(graph):
     """
     Take an instance of a ``Graph`` and return the instance's identifier and  ``type``.
 
@@ -82,27 +39,27 @@ def normalizeGraph(graph):
     >>> from rdflib.graph import Graph, ConjunctiveGraph, QuotedGraph
     >>> from rdflib.store import Store
     >>> from rdflib import URIRef, Namespace
-    >>> from rdflib_sqlalchemy.termutils import normalizeGraph
+    >>> from rdflib_sqlalchemy.termutils import normalize_graph
     >>> memstore = plugin.get('IOMemory', Store)()
     >>> g = Graph(memstore, URIRef("http://purl.org/net/bel-epa/gjh"))
-    >>> normalizeGraph(g)
+    >>> normalize_graph(g)
     (rdflib.term.URIRef(%(u)s'http://purl.org/net/bel-epa/gjh'), 'U')
     >>> g = ConjunctiveGraph(memstore, Namespace("http://rdflib.net/ns"))
-    >>> normalizeGraph(g)  #doctest: +ELLIPSIS
+    >>> normalize_graph(g)  #doctest: +ELLIPSIS
     (rdflib.term.URIRef(%(u)s'http://rdflib.net/ns'), 'U')
     >>> g = QuotedGraph(memstore, Namespace("http://rdflib.net/ns"))
-    >>> normalizeGraph(g)
+    >>> normalize_graph(g)
     (rdflib.term.URIRef(%(u)s'http://rdflib.net/ns'), 'F')
 
     """
     if isinstance(graph, QuotedGraph):
         return graph.identifier, "F"
     else:
-        return graph.identifier, term2Letter(graph.identifier)
+        return graph.identifier, term_to_letter(graph.identifier)
 
 
 @format_doctest_out
-def term2Letter(term):
+def term_to_letter(term):
     """
     Relate a given term to one of several key types.
 
@@ -118,22 +75,22 @@ def term2Letter(term):
     >>> from rdflib.term import BNode
     >>> # from rdflib.term import Statement
     >>> from rdflib.graph import Graph, QuotedGraph
-    >>> from rdflib_sqlalchemy.termutils import term2Letter
-    >>> term2Letter(URIRef('http://purl.org/net/bel-epa.com/'))
+    >>> from rdflib_sqlalchemy.termutils import term_to_letter
+    >>> term_to_letter(URIRef('http://purl.org/net/bel-epa.com/'))
     'U'
-    >>> term2Letter(BNode())
+    >>> term_to_letter(BNode())
     'B'
-    >>> term2Letter(Literal(%(u)s''))  # noqa
+    >>> term_to_letter(Literal(%(u)s''))  # noqa
     'L'
-    >>> term2Letter(Variable(%(u)s'x'))  # noqa
+    >>> term_to_letter(Variable(%(u)s'x'))  # noqa
     'V'
-    >>> term2Letter(Graph())
+    >>> term_to_letter(Graph())
     'B'
-    >>> term2Letter(QuotedGraph("IOMemory", None))
+    >>> term_to_letter(QuotedGraph("IOMemory", None))
     'F'
-    >>> term2Letter(None)
+    >>> term_to_letter(None)
     'L'
-    >>> # term2Letter(Statement((None, None, None), None)) # Deprecated
+    >>> # term_to_letter(Statement((None, None, None), None)) # Deprecated
 
     """
     if isinstance(term, URIRef):
@@ -149,7 +106,7 @@ def term2Letter(term):
     elif isinstance(term, Statement):
         return "s"
     elif isinstance(term, Graph):
-        return term2Letter(term.identifier)
+        return term_to_letter(term.identifier)
     elif term is None:
         return "L"
     else:
@@ -160,29 +117,28 @@ def term2Letter(term):
             % (term, type(term)))
 
 
-def constructGraph(key):
+def construct_graph(key):
     """
     Return a tuple containing a ``Graph`` and an appropriate referent.
 
     Takes a key (one of 'F', 'U' or 'B')
 
-    >>> from rdflib_sqlalchemy.termutils import constructGraph
-    >>> constructGraph('F')
+    >>> from rdflib_sqlalchemy.termutils import construct_graph
+    >>> construct_graph('F')
     (<class 'rdflib.graph.QuotedGraph'>, <class 'rdflib.term.URIRef'>)
-    >>> constructGraph('U')
+    >>> construct_graph('U')
     (<class 'rdflib.graph.Graph'>, <class 'rdflib.term.URIRef'>)
-    >>> constructGraph('B')
+    >>> construct_graph('B')
     (<class 'rdflib.graph.Graph'>, <class 'rdflib.term.BNode'>)
 
     """
     return GRAPH_TERM_DICT[key]
 
 
-def triplePattern2termCombinations(triple):
+def triple_pattern_to_term_combinations(triple):
     """Map a triple pattern to term combinations (non-functioning)."""
     s, p, o = triple
     combinations = []
-    # combinations.update(TERM_COMBINATIONS)
     if isinstance(o, Literal):
         for key, val in TERM_COMBINATIONS.items():
             if key[OBJECT] == 'O':
@@ -190,13 +146,13 @@ def triplePattern2termCombinations(triple):
     return combinations
 
 
-def type2TermCombination(member, klass, context):
-    """Map a type to a TermCombo."""
+def type_to_term_combination(member, klass, context):
+    """Map a type to a term combination."""
     try:
         rt = TERM_COMBINATIONS["%sU%s%s" %
-                               (term2Letter(member),
-                                term2Letter(klass),
-                                normalizeGraph(context)[-1])]
+                               (term_to_letter(member),
+                                term_to_letter(klass),
+                                normalize_graph(context)[-1])]
         return rt
     except:
         raise Exception("Unable to persist" +
@@ -204,11 +160,11 @@ def type2TermCombination(member, klass, context):
                         (member, "rdf:type", klass, context))
 
 
-def statement2TermCombination(subject, predicate, obj, context):
+def statement_to_term_combination(subject, predicate, obj, context):
     """Map a statement to a Term Combo."""
     return TERM_COMBINATIONS["%s%s%s%s" %
-                             (term2Letter(subject), term2Letter(predicate),
-                              term2Letter(obj), normalizeGraph(context)[-1])]
+                             (term_to_letter(subject), term_to_letter(predicate),
+                              term_to_letter(obj), normalize_graph(context)[-1])]
 
 
 def escape_quotes(qstr):
@@ -225,3 +181,103 @@ def escape_quotes(qstr):
     tmp = qstr.replace("\\", "\\\\")
     tmp = tmp.replace("'", "\\'")
     return tmp
+
+
+def extract_triple(tupleRt, store, hardCodedContext=None):
+    """
+    Extract a triple.
+
+    Take a tuple which represents an entry in a result set and
+    converts it to a tuple of terms using the termComb integer
+    to interpret how to instantiate each term.
+
+    """
+    try:
+        id, subject, predicate, obj, rtContext, termComb, \
+            objLanguage, objDatatype = tupleRt
+        termCombString = REVERSE_TERM_COMBINATIONS[termComb]
+        subjTerm, predTerm, objTerm, ctxTerm = termCombString
+    except ValueError:
+        id, subject, subjTerm, predicate, predTerm, obj, objTerm, \
+            rtContext, ctxTerm, objLanguage, objDatatype = tupleRt
+
+    context = rtContext is not None \
+        and rtContext \
+        or hardCodedContext.identifier
+    s = create_term(subject, subjTerm, store)
+    p = create_term(predicate, predTerm, store)
+    o = create_term(obj, objTerm, store, objLanguage, objDatatype)
+
+    graphKlass, idKlass = construct_graph(ctxTerm)
+
+    return id, s, p, o, (graphKlass, idKlass, context)
+
+
+def create_term(termString, termType, store, objLanguage=None, objDatatype=None):
+    """
+    Take a term value, term type, and store instance and creates a term object.
+
+    QuotedGraphs are instantiated differently
+    """
+    if termType == "L":
+        cache = store.literalCache.get((termString, objLanguage, objDatatype))
+        if cache is not None:
+            # store.cacheHits += 1
+            return cache
+        else:
+            # store.cacheMisses += 1
+            # rt = Literal(termString, objLanguage, objDatatype)
+            # store.literalCache[((termString, objLanguage, objDatatype))] = rt
+            if objLanguage and not objDatatype:
+                rt = Literal(termString, objLanguage)
+                store.literalCache[((termString, objLanguage))] = rt
+            elif objDatatype and not objLanguage:
+                rt = Literal(termString, datatype=objDatatype)
+                store.literalCache[((termString, objDatatype))] = rt
+            elif not objLanguage and not objDatatype:
+                rt = Literal(termString)
+                store.literalCache[((termString))] = rt
+            else:
+                rt = Literal(termString, objDatatype)
+                store.literalCache[((termString, objDatatype))] = rt
+            return rt
+    elif termType == "F":
+        cache = store.otherCache.get((termType, termString))
+        if cache is not None:
+            # store.cacheHits += 1
+            return cache
+        else:
+            # store.cacheMisses += 1
+            rt = QuotedGraph(store, URIRef(termString))
+            store.otherCache[(termType, termString)] = rt
+            return rt
+    elif termType == "B":
+        cache = store.bnodeCache.get((termString))
+        if cache is not None:
+            # store.cacheHits += 1
+            return cache
+        else:
+            # store.cacheMisses += 1
+            rt = TERM_INSTANTIATION_DICT[termType](termString)
+            store.bnodeCache[(termString)] = rt
+            return rt
+    elif termType == "U":
+        cache = store.uriCache.get((termString))
+        if cache is not None:
+            # store.cacheHits += 1
+            return cache
+        else:
+            # store.cacheMisses += 1
+            rt = URIRef(termString)
+            store.uriCache[(termString)] = rt
+            return rt
+    else:
+        cache = store.otherCache.get((termType, termString))
+        if cache is not None:
+            # store.cacheHits += 1
+            return cache
+        else:
+            # store.cacheMisses += 1
+            rt = TERM_INSTANTIATION_DICT[termType](termString)
+            store.otherCache[(termType, termString)] = rt
+            return rt
