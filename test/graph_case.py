@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 import unittest
 
-from rdflib import Graph
-from rdflib import URIRef
-from rdflib import Literal
-from rdflib import plugin
+from rdflib import Graph, URIRef, Literal, plugin, RDF
 from rdflib.parser import StringInputSource
 from rdflib.py3compat import PY3
 from rdflib.store import Store
@@ -22,6 +19,10 @@ class GraphTestCase(unittest.TestCase):
     pizza = URIRef(u"pizza")
     cheese = URIRef(u"cheese")
 
+    namespace_dc = "http://purl.org/dc/elements/1.1/"
+    namespace_dct = "http://purl.org/dc/terms/"
+    namespace_saws = "http://purl.org/saws/ontology#"
+
     def setUp(self, uri="sqlite://", storename=None):
         store = plugin.get(storename, Store)(identifier=self.identifier)
         self.graph = Graph(store, identifier=self.identifier)
@@ -29,10 +30,7 @@ class GraphTestCase(unittest.TestCase):
 
     def tearDown(self, uri="sqlite://"):
         self.graph.destroy(uri)
-        try:
-            self.graph.close()
-        except:
-            pass
+        self.graph.close()
 
     def addStuff(self):
         tarek = self.tarek
@@ -84,7 +82,7 @@ class GraphTestCase(unittest.TestCase):
         hates = self.hates
         pizza = self.pizza
         cheese = self.cheese
-        asserte = self.assertEquals
+        asserte = self.assertEqual
         triples = self.graph.triples
         Any = None
 
@@ -130,14 +128,14 @@ class GraphTestCase(unittest.TestCase):
     def testConnected(self):
         graph = self.graph
         self.addStuff()
-        self.assertEquals(True, graph.connected())
+        self.assertEqual(True, graph.connected())
 
         jeroen = URIRef("jeroen")
         unconnected = URIRef("unconnected")
 
         graph.add((jeroen, self.likes, unconnected))
 
-        self.assertEquals(False, graph.connected())
+        self.assertEqual(False, graph.connected())
 
     def testSub(self):
         g1 = Graph()
@@ -158,19 +156,19 @@ class GraphTestCase(unittest.TestCase):
 
         g3 = g1 - g2
 
-        self.assertEquals(len(g3), 1)
-        self.assertEquals((tarek, likes, pizza) in g3, True)
-        self.assertEquals((tarek, likes, cheese) in g3, False)
+        self.assertEqual(len(g3), 1)
+        self.assertEqual((tarek, likes, pizza) in g3, True)
+        self.assertEqual((tarek, likes, cheese) in g3, False)
 
-        self.assertEquals((bob, likes, cheese) in g3, False)
+        self.assertEqual((bob, likes, cheese) in g3, False)
 
         g1 -= g2
 
-        self.assertEquals(len(g1), 1)
-        self.assertEquals((tarek, likes, pizza) in g1, True)
-        self.assertEquals((tarek, likes, cheese) in g1, False)
+        self.assertEqual(len(g1), 1)
+        self.assertEqual((tarek, likes, pizza) in g1, True)
+        self.assertEqual((tarek, likes, cheese) in g1, False)
 
-        self.assertEquals((bob, likes, cheese) in g1, False)
+        self.assertEqual((bob, likes, cheese) in g1, False)
 
     def testGraphAdd(self):
         g1 = Graph()
@@ -190,19 +188,19 @@ class GraphTestCase(unittest.TestCase):
 
         g3 = g1 + g2
 
-        self.assertEquals(len(g3), 2)
-        self.assertEquals((tarek, likes, pizza) in g3, True)
-        self.assertEquals((tarek, likes, cheese) in g3, False)
+        self.assertEqual(len(g3), 2)
+        self.assertEqual((tarek, likes, pizza) in g3, True)
+        self.assertEqual((tarek, likes, cheese) in g3, False)
 
-        self.assertEquals((bob, likes, cheese) in g3, True)
+        self.assertEqual((bob, likes, cheese) in g3, True)
 
         g1 += g2
 
-        self.assertEquals(len(g1), 2)
-        self.assertEquals((tarek, likes, pizza) in g1, True)
-        self.assertEquals((tarek, likes, cheese) in g1, False)
+        self.assertEqual(len(g1), 2)
+        self.assertEqual((tarek, likes, pizza) in g1, True)
+        self.assertEqual((tarek, likes, cheese) in g1, False)
 
-        self.assertEquals((bob, likes, cheese) in g1, True)
+        self.assertEqual((bob, likes, cheese) in g1, True)
 
     def testGraphIntersection(self):
         g1 = Graph()
@@ -224,24 +222,24 @@ class GraphTestCase(unittest.TestCase):
 
         g3 = g1 * g2
 
-        self.assertEquals(len(g3), 1)
-        self.assertEquals((tarek, likes, pizza) in g3, False)
-        self.assertEquals((tarek, likes, cheese) in g3, False)
+        self.assertEqual(len(g3), 1)
+        self.assertEqual((tarek, likes, pizza) in g3, False)
+        self.assertEqual((tarek, likes, cheese) in g3, False)
 
-        self.assertEquals((bob, likes, cheese) in g3, False)
+        self.assertEqual((bob, likes, cheese) in g3, False)
 
-        self.assertEquals((michel, likes, cheese) in g3, True)
+        self.assertEqual((michel, likes, cheese) in g3, True)
 
         g1 *= g2
 
-        self.assertEquals(len(g1), 1)
+        self.assertEqual(len(g1), 1)
 
-        self.assertEquals((tarek, likes, pizza) in g1, False)
-        self.assertEquals((tarek, likes, cheese) in g1, False)
+        self.assertEqual((tarek, likes, pizza) in g1, False)
+        self.assertEqual((tarek, likes, cheese) in g1, False)
 
-        self.assertEquals((bob, likes, cheese) in g1, False)
+        self.assertEqual((bob, likes, cheese) in g1, False)
 
-        self.assertEquals((michel, likes, cheese) in g1, True)
+        self.assertEqual((michel, likes, cheese) in g1, True)
 
     def testStoreLiterals(self):
         bob = self.bob
@@ -258,14 +256,14 @@ class GraphTestCase(unittest.TestCase):
         objs = list(self.graph.objects(subject=bob, predicate=says))
         for o in objs:
             if o.value == u"hello":
-                self.assertEquals(o.language, "en")
+                self.assertEqual(o.language, "en")
             elif o.value == u"こんにちは":
-                self.assertEquals(o.language, "ja")
+                self.assertEqual(o.language, "ja")
             elif o.value == u"something":
-                self.assertEquals(o.language, None)
+                self.assertEqual(o.language, None)
             else:
                 self.fail()
-        self.assertEquals(len(list(objs)), 3)
+        self.assertEqual(len(list(objs)), 3)
 
     def testStoreLiteralsXml(self):
         bob = self.bob
@@ -280,11 +278,11 @@ class GraphTestCase(unittest.TestCase):
         self.graph.parse(StringInputSource(testdoc), formal="xml")
 
         objs = list(self.graph)
-        self.assertEquals(len(objs), 3)
+        self.assertEqual(len(objs), 3)
         for o in objs:
-            self.assertEquals(o[0], bob)
-            self.assertEquals(o[1], says)
-            self.assertTrue(o[2] in objects)
+            self.assertEqual(o[0], bob)
+            self.assertEqual(o[1], says)
+            self.assertIn(o[2], objects)
 
     def testStoreLiteralsXmlQuote(self):
         bob = self.bob
@@ -296,9 +294,102 @@ class GraphTestCase(unittest.TestCase):
         self.graph.parse(StringInputSource(testdoc), formal="xml")
 
         objs = list(self.graph)
-        self.assertEquals(len(objs), 1)
+        self.assertEqual(len(objs), 1)
         o = objs[0]
-        self.assertEquals(o, (bob, says, imtheone))
+        self.assertEqual(o, (bob, says, imtheone))
+
+    def testBindNamespace(self):
+        """ Check that bound namespaced with prefix (including empty ones) are correctly kept """
+        self.graph.bind("", self.namespace_dc)
+        self.graph.bind("dct", self.namespace_dct)
+        self.assertEqual(
+            self.graph.qname(self.namespace_dct + u"title"), "dct:title",
+            "Prefixed namespace should be stored and retrieved"
+        )
+        self.assertEqual(
+            self.graph.qname(self.namespace_dc + u"title"), "title",
+            "Empty prefixes for namespace should be stored and retrieved"
+        )
+        self.assertEqual(
+            self.graph.qname(self.namespace_saws + u"title"), "ns1:title",
+            "Unknown prefixes for namespace should be transformed to nsX"
+        )
+
+    def testTriplesChoices(self):
+        likes = self.likes
+        pizza = self.pizza
+        cheese = self.cheese
+        tarek = self.tarek
+        michel = self.michel
+        bob = self.bob
+        self.addStuff()
+        trips = self.graph.triples_choices((None, likes, [pizza, cheese]))
+        self.assertEqual(
+            set(trips),
+            set([(tarek, likes, pizza),
+                 (tarek, likes, pizza),
+                 (tarek, likes, cheese),
+                 (michel, likes, pizza),
+                 (michel, likes, cheese),
+                 (bob, likes, cheese)])
+        )
+
+    def test_type_add(self):
+        trip = (URIRef('http://example.org#type-add'), RDF.type, URIRef('http://example.org/cra'))
+        self.graph.add(trip)
+        self.graph.add(trip)
+        # No exception raised
+
+    def test_type_addn(self):
+        quad = (URIRef('http://example.org#type-addn'), RDF.type, URIRef('http://example.org/cra'), self.graph)
+        self.graph.addN([quad, quad])
+        # No exception raised
+
+    def test_add(self):
+        trip = (URIRef('http://example.org#add'), URIRef('http://example.org/blah'), URIRef('http://example.org/cra'))
+        self.graph.add(trip)
+        self.graph.add(trip)
+        # No exception raised
+
+    def test_addn(self):
+        quad = (URIRef('http://example.org#addn'),
+                URIRef('http://example.org/blah'),
+                URIRef('http://example.org/cra'),
+                self.graph)
+        self.graph.addN([quad, quad])
+        # No exception raised
+
+    def test_namespace_change_prefix_binding(self):
+        nm = self.graph.namespace_manager
+        nm.bind('change_binding', URIRef('http://example.org/change-binding-1#'),
+                replace=True)
+        nm.bind('change_binding', URIRef('http://example.org/change-binding-2#'),
+                replace=True)
+        self.assertIn(
+            ('change_binding', URIRef('http://example.org/change-binding-2#')),
+            list(nm.namespaces())
+        )
+
+    def test_namespace_rebind_prefix(self):
+        nm = self.graph.namespace_manager
+        nm.bind('rebind', URIRef('http://example.org/rebind#'))
+        nm.bind('rebind', URIRef('http://example.org/rebind#'))
+
+    def test_add_duplicate_length(self):
+        '''
+        Test that adding duplicate triples doesn't increase the length of the graph
+        '''
+        trip = (URIRef('http://example.org#add'), URIRef('http://example.org/blah'), URIRef('http://example.org/cra'))
+        self.graph.add(trip)
+        self.graph.add(trip)
+        self.assertEqual(len(self.graph), 1)
+    # additional tests
+    # - add "duplicate" triples and query -- ensure the graph length counts only distinct
+    #   triples
+    # - add duplicate triples and query -- ensure there are no duplicate entries in the
+    #   query result
+    # - repeat the above two for type triples
+    # - test with quoted graphs (not even sure how that works)
 
 
 xmltestdoc = """<?xml version="1.0" encoding="UTF-8"?>
