@@ -14,9 +14,7 @@ from rdflib.namespace import RDF
 from rdflib.plugins.stores.regexmatching import PYTHON_REGEX, REGEXTerm
 from rdflib.store import CORRUPTED_STORE, VALID_STORE, NodePickler, Store
 from six import text_type
-from six.moves import reduce
 from sqlalchemy import MetaData
-from sqlalchemy.engine import reflection
 from sqlalchemy.sql import expression, select
 
 from rdflib_sqlalchemy.constants import (
@@ -46,6 +44,25 @@ from rdflib_sqlalchemy.termutils import extract_triple
 _logger = logging.getLogger(__name__)
 
 Any = None
+
+
+def grouper(iterable, n):
+    "Collect data into chunks of at most n elements"
+    assert n > 0, 'Cannot group into chunks of zero elements'
+    lst = []
+    iterable = iter(iterable)
+    while True:
+        try:
+            lst.append(next(iterable))
+        except StopIteration:
+            break
+
+        if len(lst) == n:
+            yield lst
+            lst = []
+
+    if lst:
+        yield lst
 
 
 def generate_interned_id(identifier):
@@ -78,17 +95,26 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
     regex_matching = PYTHON_REGEX
     configuration = Literal("sqlite://")
 
-    def __init__(self, identifier=None, configuration=None, engine=None):
+    def __init__(self, identifier=None, configuration=None, engine=None,
+                 max_terms_per_where=800):
         """
         Initialisation.
 
         Args:
             identifier (rdflib.URIRef): URIRef of the Store. Defaults to CWD.
-            engine (sqlalchemy.engine.Engine, optional): a `SQLAlchemy.engine.Engine` instance
-
+            configuration: the database connection URL string or a configuration dictionary
+                corresponding to the connection options accepted by sqlalchemy.create_engine,
+                with the additional "url" key pointing to the connection URL. See `open` documentation
+                for more details.
+            engine (sqlalchemy.engine.Engine, optional): a pre-existing `SQLAlchemy.engine.Engine` instance.
+            max_terms_per_where (int): The max number of terms (s/p/o) in a call to
+                triples_choices to combine in one SQL "where" clause. Important for SQLite
+                back-end with SQLITE_MAX_EXPR_DEPTH limit and SQLITE_LIMIT_COMPOUND_SELECT
+                -- must find a balance that doesn't hit either of those.
         """
         self.identifier = identifier and identifier or "hardcoded"
         self.engine = engine
+        self.max_terms_per_where = max_terms_per_where
 
         # Use only the first 10 bytes of the digest
         self._interned_id = generate_interned_id(self.identifier)
@@ -116,8 +142,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
         # XXX For backward compatibility we still support getting the connection string in constructor
         # TODO: deprecate this once refactoring is more mature
-        if configuration:
-            self.open(configuration)
+        super(SQLAlchemy, self).__init__(configuration)
 
     def __repr__(self):
         """Readable serialisation."""
@@ -140,13 +165,14 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 typeLen, quotedLen, assertedLen, literalLen = [
                     rtTuple[0] for rtTuple in rt]
             try:
-                return ("<Partitioned SQL N3 Store: %s " +
-                        "contexts, %s classification assertions, " +
-                        "%s quoted statements, %s property/value " +
+                return ("<Partitioned SQL N3 Store: %s "
+                        "contexts, %s classification assertions, "
+                        "%s quoted statements, %s property/value "
                         "assertions, and %s other assertions>" % (
-                            len([ctx for ctx in self.contexts()]),
+                            sum(1 for _ in self.contexts()),
                             typeLen, quotedLen, literalLen, assertedLen))
             except Exception:
+                _logger.exception('Error creating repr')
                 return "<Partitioned SQL N3 Store>"
         else:
             return "<Partitioned unopened SQL N3 Store>"
@@ -192,7 +218,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         with self.engine.connect() as connection:
             res = connection.execute(q)
             rt = res.fetchall()
-            return reduce(lambda x, y: x + y, [rtTuple[0] for rtTuple in rt])
+            return sum(rtTuple[0] for rtTuple in rt)
 
     @property
     def table_names(self):
@@ -214,9 +240,14 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def open(self, configuration, create=True):
         """
-        Open the store specified by the configuration string.
+        Open the store specified by the configuration parameter.
 
         Args:
+            configuration: if a string, use as the DBAPI URL. If a dictionary, will use as the **kwargs
+                for the sqlalchemy.create_engine() call, and will attempt to extract the connection URL
+                from a 'url' key in that dictionary.
+                A valid connection string will be of the format:
+                    dialect[+driver]://user:password@host/dbname[?key=value..]
             create (bool): If create is True a store will be created if it does not already
                 exist. If create is False and a store does not already exist
                 an exception is raised. An exception is also raised if a store
@@ -232,7 +263,14 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         # Close any existing engine connection
         self.close()
 
-        self.engine = sqlalchemy.create_engine(configuration)
+        url, kwargs = configuration, {}
+        if isinstance(configuration, dict):
+            url = configuration.pop("url", None)
+            if not url:
+                raise Exception('Configuration dict is missing the required "url" key')
+            kwargs = configuration
+
+        self.engine = sqlalchemy.create_engine(url, **kwargs)
         with self.engine.connect():
             if create:
                 self.create_all()
@@ -253,6 +291,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         Close the current store engine connection if one is open.
 
         """
+        if self.engine:
+            self.engine.dispose()
         self.engine = None
 
     def destroy(self, configuration):
@@ -276,6 +316,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def add(self, triple, context=None, quoted=False):
         """Add a triple to the store of triples."""
+        super(SQLAlchemy, self).add(triple, context, quoted)
         subject, predicate, obj = triple
         _, statement, params = self._get_build_command(
             (subject, predicate, obj),
@@ -321,6 +362,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def remove(self, triple, context):
         """Remove a triple from the store."""
+        super(SQLAlchemy, self).remove(triple, context)
         subject, predicate, obj = triple
 
         if context is not None:
@@ -367,25 +409,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 _logger.exception("Removal failed.")
                 trans.rollback()
 
-    def triples(self, triple, context=None):
-        """
-        A generator over all the triples matching pattern.
-
-        Pattern can be any objects for comparing against nodes in
-        the store, for example, RegExLiteral, Date? DateRange?
-
-        quoted table:                <id>_quoted_statements
-        asserted rdf:type table:     <id>_type_statements
-        asserted non rdf:type table: <id>_asserted_statements
-
-        triple columns:
-            subject, predicate, object, context, termComb, objLanguage, objDatatype
-        class membership columns:
-            member, klass, context, termComb
-
-        FIXME:  These union all selects *may* be further optimized by joins
-
-        """
+    def _triples_helper(self, triple, context=None):
         subject, predicate, obj = triple
 
         quoted_table = self.tables["quoted_statements"]
@@ -411,10 +435,10 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             # Literal partition if (obj is Literal or None) and asserted
             # non rdf:type partition (if obj is URIRef or None)
             selects = []
-            if not self.STRONGLY_TYPED_TERMS \
-                    or isinstance(obj, Literal) \
-                    or not obj \
-                    or (self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm)):
+            if (not self.STRONGLY_TYPED_TERMS
+                    or isinstance(obj, Literal)
+                    or not obj
+                    or (self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm))):
                 literal = expression.alias(literal_table, "literal")
                 clause = self.build_clause(literal, subject, predicate, obj, context)
                 selects.append((literal, clause, ASSERTED_LITERAL_PARTITION))
@@ -455,32 +479,50 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             clause = self.build_clause(quoted, subject, predicate, obj, context)
             selects.append((quoted, clause, QUOTED_PARTITION))
 
-        q = union_select(selects, select_type=TRIPLE_SELECT_NO_ORDER)
-        with self.engine.connect() as connection:
-            ### This causes the database to stream the results to Python via a serverside cursor
-            res = (connection.execution_options(stream_results=True).execute(q))
+        return selects
 
+    def _do_triples_select(self, selects, context):
+        q = union_select(selects, distinct=True, select_type=TRIPLE_SELECT_NO_ORDER)
+        with self.engine.connect() as connection:
+            res = connection.execute(q)
             # TODO: False but it may have limitations on text column. Check
             # NOTE: SQLite does not support ORDER BY terms that aren't
             # integers, so the entire result set must be iterated in order
             # to be able to return a generator of contexts
+            result = res.fetchall()
+        tripleCoverage = {}
 
-            while True:
-                result = res.fetchmany(1000)
-                if not result:
-                    break
-                tripleCoverage = {}
+        for rt in result:
+            id, s, p, o, (graphKlass, idKlass, graphId) = extract_triple(rt, self, context)
+            contexts = tripleCoverage.get((s, p, o), [])
+            contexts.append(graphKlass(self, idKlass(graphId)))
+            tripleCoverage[(s, p, o)] = contexts
 
-                for rt in result:
-                    id, s, p, o, (graphKlass, idKlass, graphId) = extract_triple(rt, self, context)
-                    contexts = tripleCoverage.get((s, p, o), [])
-                    contexts.append(graphKlass(self, idKlass(graphId)))
-                    tripleCoverage[(s, p, o)] = contexts
+        for (s, p, o), contexts in tripleCoverage.items():
+            yield (s, p, o), (c for c in contexts)
 
-                for (s, p, o), contexts in tripleCoverage.items():
-                    yield (s, p, o), (c for c in contexts)
+    def triples(self, triple, context=None):
+        """
+        A generator over all the triples matching pattern.
 
-                del result
+        Pattern can be any objects for comparing against nodes in
+        the store, for example, RegExLiteral, Date? DateRange?
+
+        quoted table:                <id>_quoted_statements
+        asserted rdf:type table:     <id>_type_statements
+        asserted non rdf:type table: <id>_asserted_statements
+
+        triple columns:
+            subject, predicate, object, context, termComb, objLanguage, objDatatype
+        class membership columns:
+            member, klass, context, termComb
+
+        FIXME:  These union all selects *may* be further optimized by joins
+
+        """
+        selects = self._triples_helper(triple, context)
+        for m in self._do_triples_select(selects, context):
+            yield m
 
     def triples_choices(self, triple, context=None):
         """
@@ -491,8 +533,9 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         import default 'fallback' implementation, which will iterate over
         each term in the list and dispatch to triples.
         """
+        # We already support accepting a list for s/p/o
         subject, predicate, object_ = triple
-
+        selects = []
         if isinstance(object_, list):
             assert not isinstance(
                 subject, list), "object_ / subject are both lists"
@@ -500,27 +543,30 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 predicate, list), "object_ / predicate are both lists"
             if not object_:
                 object_ = None
-            for (s1, p1, o1), cg in self.triples(
-                    (subject, predicate, object_), context):
-                yield (s1, p1, o1), cg
+            for o in grouper(object_, self.max_terms_per_where):
+                for sels in self._triples_helper((subject, predicate, o), context):
+                    selects.append(sels)
 
         elif isinstance(subject, list):
             assert not isinstance(
                 predicate, list), "subject / predicate are both lists"
             if not subject:
                 subject = None
-            for (s1, p1, o1), cg in self.triples(
-                    (subject, predicate, object_), context):
-                yield (s1, p1, o1), cg
+            for s in grouper(subject, self.max_terms_per_where):
+                for sels in self._triples_helper((s, predicate, object_), context):
+                    selects.append(sels)
 
         elif isinstance(predicate, list):
             assert not isinstance(
                 subject, list), "predicate / subject are both lists"
             if not predicate:
                 predicate = None
-            for (s1, p1, o1), cg in self.triples(
-                    (subject, predicate, object_), context):
-                yield (s1, p1, o1), cg
+            for p in grouper(predicate, self.max_terms_per_where):
+                for sels in self._triples_helper((subject, p, object_), context):
+                    selects.append(sels)
+
+        for m in self._do_triples_select(selects, context):
+            yield m
 
     def contexts(self, triple=None):
         quoted_table = self.tables["quoted_statements"]
@@ -570,9 +616,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 # partition (optionally)
                 selects = []
                 if (not self.STRONGLY_TYPED_TERMS or
-                        isinstance(obj, Literal) or
-                        not obj
-                        or (self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm))):
+                        isinstance(obj, Literal) or not obj or (
+                            self.STRONGLY_TYPED_TERMS and isinstance(obj, REGEXTerm))):
                     clause = self.build_clause(literal, subject, predicate, obj)
                     selects.append(
                         (literal, clause, ASSERTED_LITERAL_PARTITION))
@@ -652,13 +697,16 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
 
     def bind(self, prefix, namespace):
         """Bind prefix for namespace."""
-        with self.engine.connect() as connection:
+        with self.engine.begin() as connection:
             try:
-                ins = self.tables["namespace_binds"].insert().values(
-                    prefix=prefix, uri=namespace)
-                connection.execute(ins)
+                binds_table = self.tables["namespace_binds"]
+                prefix = text_type(prefix)
+                namespace = text_type(namespace)
+                connection.execute(binds_table.delete().where(binds_table.c.prefix == prefix))
+                connection.execute(binds_table.insert().values(prefix=prefix, uri=namespace))
             except Exception:
                 _logger.exception("Namespace binding failed.")
+                raise
 
     def prefix(self, namespace):
         """Prefix."""
@@ -669,7 +717,9 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             res = connection.execute(s)
             rt = [rtTuple[0] for rtTuple in res.fetchall()]
             res.close()
-            return rt and rt[0] or None
+            if rt and (rt[0] or rt[0] == ""):
+                return rt[0]
+        return None
 
     def namespace(self, prefix):
         res = None
@@ -682,12 +732,13 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
                 rt = [rtTuple[0] for rtTuple in res.fetchall()]
                 res.close()
                 return rt and URIRef(rt[0]) or None
-        except:
+        except Exception:
+            _logger.warning('exception in namespace retrieval', exc_info=True)
             return None
 
     def namespaces(self):
         with self.engine.connect() as connection:
-            res = connection.execute(self.tables["namespace_binds"].select())
+            res = connection.execute(self.tables["namespace_binds"].select(distinct=True))
             for prefix, uri in res.fetchall():
                 yield prefix, uri
 
@@ -749,9 +800,9 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             command_type = "type"
         return command_type, statement, params
 
-    def _remove_context(self, identifier):
+    def _remove_context(self, context):
         """Remove context."""
-        assert identifier
+        assert context
         quoted_table = self.tables["quoted_statements"]
         asserted_table = self.tables["asserted_statements"]
         asserted_type_table = self.tables["type_statements"]
@@ -762,7 +813,7 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
             try:
                 for table in [quoted_table, asserted_table,
                               asserted_type_table, literal_table]:
-                    clause = self.build_context_clause(identifier, table)
+                    clause = self.build_context_clause(context, table)
                     connection.execute(table.delete(clause))
                 trans.commit()
             except Exception:
@@ -778,8 +829,8 @@ class SQLAlchemy(Store, SQLGeneratorMixin, StatisticsMixin):
         inspector = reflection.Inspector.from_engine(self.engine)
         existing_table_names = inspector.get_table_names()
         for table_name in self.table_names:
-            if table_name not in existing_table_names:
-                _logger.critical("create_all() - table %s Doesn't exist!", table_name)
+            if not self.engine.has_table(table_name):
+                _logger.critical("create_all() - table %s is not known", table_name)
                 # The database exists, but one of the tables doesn't exist
                 return CORRUPTED_STORE
 
